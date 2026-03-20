@@ -721,8 +721,13 @@ def pairwise_align_spatiotemporal(
     pi_final = pi_np.astype(np.float64)
 
     # ── Store growth and deformation info in sliceB ────────────────────────
-    # These are useful for downstream analysis (visualisation, trajectory inference)
-    sliceB.obs['incent_se_growth'] = xi
+    # _preprocess() returns sliceB as a filtered *view* (subset to shared
+    # genes / cell types).  Assigning to .obs or .obsm of a view triggers
+    # AnnData's ImplicitModificationWarning because it has to silently
+    # promote the view to a full copy first.  We make that copy explicit
+    # here so the assignment is clean and warning-free.
+    sliceB            = sliceB.copy()
+    sliceB.obs['incent_se_growth']  = xi
     coords_B_deformed = phi.apply(coords_B_np)
     sliceB.obsm['spatial_deformed'] = coords_B_deformed
 
