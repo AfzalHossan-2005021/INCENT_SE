@@ -22,6 +22,8 @@ from .incent import (
     pairwise_align_unbalanced,
     neighborhood_distribution,
     cosine_distance,
+    _preprocess,
+    _to_np,
 
     fused_gromov_wasserstein_incent,
     jensenshannon_divergence_backend,
@@ -66,6 +68,8 @@ __all__ = [
     'pairwise_align_unbalanced',
     'neighborhood_distribution',
     'cosine_distance',
+    '_preprocess',
+    '_to_np',
     'fused_gromov_wasserstein_incent',
     'jensenshannon_divergence_backend',
     'pairwise_msd',
