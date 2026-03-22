@@ -71,6 +71,17 @@ from .cvae import (
     latent_cost,
 )
 
+# ── INCENT-SE: RAPA (Region-Aware Partial Alignment) ─────────────────────────
+from .rapa import (
+    pairwise_align_rapa,
+    decompose_target,
+    match_source_to_region,
+    build_anchor_cost,
+    apply_rotation_only_pose,
+    apply_region_translation,
+    target_contiguity_gradient,
+)
+
 # ── INCENT-SE: LDDMM deformation ─────────────────────────────────────────────
 from .lddmm import (
     LDDMMDeformation,
@@ -88,6 +99,8 @@ __all__ = [
     'neighborhood_distribution', 'cosine_distance',
     'fused_gromov_wasserstein_incent', 'jensenshannon_divergence_backend',
     'pairwise_msd', 'to_dense_array', 'extract_data_matrix',
+    '_preprocess', '_to_np',
+
     # INCENT-SE alignment
     'pairwise_align_se', 'pairwise_align_spatiotemporal',
     # Pose
@@ -99,6 +112,10 @@ __all__ = [
     'contiguity_regulariser', 'contiguity_gradient', 'estimate_overlap_fraction',
     # cVAE
     'INCENT_cVAE', 'train_cvae', 'latent_cost',
+    # RAPA
+    'pairwise_align_rapa', 'decompose_target', 'match_source_to_region',
+    'build_anchor_cost', 'apply_rotation_only_pose', 'apply_region_translation',
+    'target_contiguity_gradient',
     # LDDMM
     'LDDMMDeformation', 'estimate_deformation',
     'deformed_distances', 'estimate_growth_vector',

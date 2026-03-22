@@ -55,6 +55,15 @@ from .incent import (
     train_cvae,
     latent_cost,
 
+# ── INCENT-SE: Region-Aware Partial Alignment (RAPA) ───────────────────────────────────────────────
+    pairwise_align_rapa,
+    decompose_target,
+    match_source_to_region,
+    build_anchor_cost,
+    apply_rotation_only_pose,
+    apply_region_translation,
+    target_contiguity_gradient,
+
 # ── INCENT-SE: LDDMM deformation ─────────────────────────────────────────────
     LDDMMDeformation,
     estimate_deformation,
@@ -97,6 +106,14 @@ __all__ = [
     'INCENT_cVAE',
     'train_cvae',
     'latent_cost',
+    # RAPA
+    'pairwise_align_rapa',
+    'decompose_target',
+    'match_source_to_region',
+    'build_anchor_cost',
+    'apply_rotation_only_pose',
+    'apply_region_translation',
+    'target_contiguity_gradient',
     # LDDMM
     'LDDMMDeformation',
     'estimate_deformation',

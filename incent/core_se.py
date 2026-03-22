@@ -398,6 +398,11 @@ def pairwise_align_spatiotemporal(
     gamma:     float,
     radius:    float,
     filePath:  str,
+    # ── RAPA: region-aware partial alignment (strongly recommended for cross-timepoint) ──
+    use_rapa:          bool             = True,
+    leiden_resolution: float           = 0.3,
+    lambda_anchor:     float           = 2.0,
+    lambda_target:     float           = 0.1,
     # ── cVAE for expression embedding ─────────────────────────────────────────
     cvae_model: Optional[INCENT_cVAE]  = None,
     cvae_path:  Optional[str]          = None,
@@ -434,6 +439,17 @@ def pairwise_align_spatiotemporal(
 ) -> Union[NDArray, Tuple]:
     """
     Joint cross-timepoint alignment: OT correspondence + LDDMM deformation.
+
+    For partial-overlap cross-timepoint data (e.g. one hemisphere vs two
+    hemispheres, different timepoints), set ``use_rapa=True`` (default).
+    This enables the Region-Aware Partial Alignment pipeline (RAPA) which:
+      1. Uses rotation-only pose (discards scanner-frame translation)
+      2. Decomposes sliceB into spatial communities (hemispheres, chambers…)
+      3. Matches sliceA to the correct community and recovers fine translation
+      4. Runs unbalanced FUGW anchored to the matched community
+
+    Set ``use_rapa=False`` to use the original BCD pipeline (for full-overlap
+    or same-timepoint pairs where coordinate frames are compatible).
 
     This is the full INCENT-SE Stage 5 function.  It solves the combined
     problem of finding (a) which cell in sliceB corresponds to which cell in
@@ -526,6 +542,47 @@ def pairwise_align_spatiotemporal(
     """
     start = time.time()
     os.makedirs(filePath, exist_ok=True)
+
+    # ── RAPA dispatch ──────────────────────────────────────────────────────────
+    # For cross-timepoint partial-overlap cases (default), delegate to RAPA.
+    # RAPA handles the three failures of the original pipeline:
+    #   (1) Scanner-frame translation (use rotation-only pose instead)
+    #   (2) Balanced OT on a partial-overlap pair (use unbalanced FUGW)
+    #   (3) No mechanism to choose the correct organ sub-region (use region matching)
+    if use_rapa:
+        from .rapa import pairwise_align_rapa
+        theta_deg = None
+        if estimate_rotation:
+            from .pose import estimate_pose as _est_pose
+            theta_deg, _, _, _ = _est_pose(sliceA, sliceB, grid_size=256,
+                                           verbose=gpu_verbose)
+        result = pairwise_align_rapa(
+            sliceA=sliceA, sliceB=sliceB,
+            alpha=alpha, beta=beta, gamma=gamma,
+            radius=radius, filePath=filePath,
+            theta_deg=theta_deg,
+            estimate_rotation=False,       # already done above
+            rotation_only_pose=True,       # discard scanner-frame translation
+            leiden_resolution=leiden_resolution,
+            lambda_anchor=lambda_anchor,
+            lambda_spatial=lambda_spatial,
+            lambda_target=lambda_target,
+            cvae_model=cvae_model, cvae_path=cvae_path,
+            cvae_epochs=cvae_epochs, cvae_latent_dim=cvae_latent_dim,
+            use_rep=use_rep,
+            numItermax=numItermax,
+            use_gpu=use_gpu, gpu_verbose=gpu_verbose, verbose=verbose,
+            sliceA_name=sliceA_name, sliceB_name=sliceB_name,
+            overwrite=overwrite,
+            neighborhood_dissimilarity=neighborhood_dissimilarity,
+            return_diagnostics=return_obj,
+        )
+        if return_obj:
+            pi, diag = result
+            return pi, diag['matched_region'], diag['overlap_fraction'], \
+                   diag['region_scores'], diag
+        return result
+    # ── End RAPA dispatch (use_rapa=False falls through to original BCD) ───────
 
     log_name = (f"{filePath}/log_st_{sliceA_name}_{sliceB_name}.txt"
                 if sliceA_name and sliceB_name else f"{filePath}/log_st.txt")

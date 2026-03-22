@@ -186,7 +186,7 @@ def generic_conditional_gradient_incent(
         a, b, M1, M2, f, df, reg1, reg2,
         lp_solver, line_search, gamma,
         G0=None, numItermax=6000,
-        stopThr=1e-9, stopThr2=1e-9,
+        stopThr=1e-6, stopThr2=1e-6,
         verbose=False, log=False, **kwargs):
     """
     Generalised conditional gradient for the (F)GW problem with two
@@ -195,6 +195,23 @@ def generic_conditional_gradient_incent(
     Objective:
         min_G  <M1 + gamma*M2, G> + reg1 * f(G)
         s.t.   G 1 = a,  G^T 1 = b,  G >= 0
+
+    stopThr default is 1e-6
+    ------------------------------------
+    On GPU all tensors are float32 (machine epsilon ε ≈ 1.2e-7).  The
+    relative cost change cannot be measured below ~ε, so stopThr=1e-9
+    would never fire — the loop would run until numItermax, wasting
+    iterations whose objective changes are below float32 resolution.
+
+    1e-6 is the float32-honest threshold: it stops as soon as changes
+    are no longer numerically distinguishable.  This is biologically
+    safe because the smallest meaningful OT plan change (one cell being
+    reassigned) causes a Δobj ~ 1.3e-4, which is 130× larger than 1e-6.
+
+    On CPU (float64, ε ≈ 1.1e-16) the loop will naturally converge
+    before 1e-6 for well-conditioned problems, so this default is also
+    correct there (just slightly more permissive than the old 1e-9).
+    Pass stopThr=1e-9 explicitly if you need CPU float64 fine convergence.
     """
     a, b, M1, M2, G0 = list_to_array(a, b, M1, M2, G0)
     nx = get_backend(a, b, M1) if not (isinstance(M1, (int, float))) \
@@ -274,7 +291,7 @@ def generic_conditional_gradient_incent(
 def cg_incent(a, b, M1, M2, reg, f, df, gamma,
               G0=None, line_search=line_search_armijo,
               numItermax=6000, numItermaxEmd=100000,
-              stopThr=1e-9, stopThr2=1e-9,
+              stopThr=1e-6, stopThr2=1e-6,
               verbose=False, log=False, **kwargs):
     """
     Conditional gradient with Sinkhorn-unbalanced inner LP solver.
@@ -309,7 +326,7 @@ def fused_gromov_wasserstein_incent(
         M1, M2, C1, C2, p, q, gamma,
         G_init=None, loss_fun='square_loss',
         alpha=0.1, armijo=False, log=False,
-        numItermax=6000, tol_rel=1e-9, tol_abs=1e-9,
+        numItermax=6000, tol_rel=1e-6, tol_abs=1e-6,
         use_gpu=False, **kwargs):
     """
     FGW objective:
