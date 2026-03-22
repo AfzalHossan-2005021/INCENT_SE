@@ -83,8 +83,11 @@ def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name,
     B_X = nx.from_numpy(to_dense_array(extract_data_matrix(sliceB, use_rep)))
 
     if isinstance(nx, ot.backend.TorchBackend) and use_gpu:
-        A_X = A_X.cuda()
-        B_X = B_X.cuda()
+        # Cast to float32 before moving to GPU.  Expression matrices may be
+        # float64 (e.g. from AnnData backed by float64 .X) or float32 — both
+        # need to be unified to float32 for GPU matmul compatibility.
+        A_X = A_X.float().cuda()
+        B_X = B_X.float().cuda()
 
     s_A = A_X + 0.01
     s_B = B_X + 0.01
@@ -95,7 +98,8 @@ def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name,
         print("Loading cached cosine distance matrix")
         mat = np.load(fileName)
         if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-            return torch.from_numpy(mat).cuda()
+            # np.load always returns float64; cast to float32 for GPU compatibility.
+            return torch.from_numpy(mat.astype(np.float32)).cuda()
         return mat
 
     print("Computing cosine distance matrix")
@@ -123,18 +127,6 @@ def _to_np(x):
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy().astype(np.float64)
     return np.asarray(x, dtype=np.float64)
-
-
-def _hard_assignment_from_coupling(pi: np.ndarray) -> np.ndarray:
-    """Project a soft coupling to a hard one-to-one assignment matrix."""
-    from scipy.optimize import linear_sum_assignment
-
-    pi_np = np.asarray(pi, dtype=np.float64)
-    row_ind, col_ind = linear_sum_assignment(-pi_np)
-
-    hard_pi = np.zeros_like(pi_np, dtype=np.float64)
-    hard_pi[row_ind, col_ind] = 1.0
-    return hard_pi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,8 +214,11 @@ def _preprocess(
     logFile.write(f"Normalized by max: D_A max={float(nx.max(D_A)):.6f}, D_B max={float(nx.max(D_B)):.6f}\n")
 
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-        D_A = D_A.cuda()
-        D_B = D_B.cuda()
+        # D_A/D_B are float32 (computed from float32 coords above).
+        # .float() is a no-op here but makes the GPU dtype contract explicit
+        # and guards against future upstream changes that might alter coord dtype.
+        D_A = D_A.float().cuda()
+        D_B = D_B.float().cuda()
 
     # ── Gene-expression cost ───────────────────────────────────────────────────
     cosine_dist_gene_expr = cosine_distance(
@@ -236,7 +231,9 @@ def _preprocess(
     M_celltype = (lab_A[:, None] != lab_B[None, :]).astype(np.float64)
 
     if isinstance(cosine_dist_gene_expr, torch.Tensor):
-        M_ct = torch.from_numpy(M_celltype).to(cosine_dist_gene_expr.device)
+        # cosine_dist_gene_expr is float32 on GPU; M_celltype is float64 numpy.
+        # Cast M_ct to float32 so the addition does not trigger a dtype error.
+        M_ct = torch.from_numpy(M_celltype.astype(np.float32)).to(cosine_dist_gene_expr.device)
         M1   = (1.0 - beta) * cosine_dist_gene_expr + beta * M_ct
     else:
         M1 = nx.from_numpy(
@@ -269,9 +266,9 @@ def _preprocess(
 
     if use_gpu:
         if isinstance(nd_A, np.ndarray):
-            nd_A = torch.from_numpy(nd_A).cuda()
+            nd_A = torch.from_numpy(nd_A.astype(np.float32)).cuda()
         if isinstance(nd_B, np.ndarray):
-            nd_B = torch.from_numpy(nd_B).cuda()
+            nd_B = torch.from_numpy(nd_B.astype(np.float32)).cuda()
 
     # ── Neighbourhood dissimilarity M2 ────────────────────────────────────────
     if neighborhood_dissimilarity == 'jsd':
@@ -279,7 +276,7 @@ def _preprocess(
         if os.path.exists(jsd_cache) and not overwrite:
             print("Loading cached JSD matrix")
             js_dist = np.load(jsd_cache)
-            M2 = (torch.from_numpy(js_dist).cuda()
+            M2 = (torch.from_numpy(js_dist.astype(np.float32)).cuda()
                   if use_gpu and isinstance(nx, ot.backend.TorchBackend)
                   else nx.from_numpy(js_dist))
         else:
@@ -294,8 +291,9 @@ def _preprocess(
 
     elif neighborhood_dissimilarity == 'cosine':
         if isinstance(nd_A, torch.Tensor):
-            na  = nd_A.cuda() if use_gpu else nd_A
-            nb  = nd_B.cuda() if use_gpu else nd_B
+            # nd_A/nd_B were pushed as float32 earlier; .float() is defensive.
+            na  = nd_A.float().cuda() if use_gpu else nd_A
+            nb  = nd_B.float().cuda() if use_gpu else nd_B
             num = na @ nb.T
             den = na.norm(dim=1)[:, None] * nb.norm(dim=1)[None, :]
             M2  = 1.0 - num / (den + 1e-12)
@@ -319,10 +317,10 @@ def _preprocess(
 
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):
         if not isinstance(M1, torch.Tensor):
-            M1 = torch.from_numpy(np.asarray(M1)).cuda()
+            M1 = torch.from_numpy(np.asarray(M1, dtype=np.float32)).cuda()
         if not isinstance(M2, torch.Tensor):
-            M2 = torch.from_numpy(np.asarray(M2)).cuda()
-        M1, M2 = M1.cuda(), M2.cuda()
+            M2 = torch.from_numpy(np.asarray(M2, dtype=np.float32)).cuda()
+        M1, M2 = M1.float().cuda(), M2.float().cuda()
 
     # ── Marginals ──────────────────────────────────────────────────────────────
     if a_distribution is None:
@@ -336,8 +334,10 @@ def _preprocess(
         b = nx.from_numpy(b_distribution)
 
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-        a = a.cuda()
-        b = b.cuda()
+        # nx.ones() already gives float32; nx.from_numpy(user_array) may be float64.
+        # .float() normalises both cases to float32 before moving to GPU.
+        a = a.float().cuda()
+        b = b.float().cuda()
 
     # ── Initial transport plan ─────────────────────────────────────────────────
     if G_init is not None:
@@ -388,7 +388,6 @@ def pairwise_align(
     sliceB_name: Optional[str] = None,
     overwrite: bool            = False,
     neighborhood_dissimilarity: str = 'jsd',
-    hard_assignment: bool      = False,
     **kwargs,
 ) -> Union[NDArray[np.floating],
            Tuple[NDArray[np.floating], float, float, float, float]]:
@@ -460,9 +459,6 @@ def pairwise_align(
     )
     pi = nx.to_numpy(pi)
 
-    if hard_assignment:
-        pi = _hard_assignment_from_coupling(pi)
-
     # Final objective logging
     final_nb = 0.0
     if p['nd_dissim'] == 'jsd':
@@ -499,7 +495,7 @@ def pairwise_align_unbalanced(
     filePath:  str,
     # ── new FUGW parameters ───────────────────────────────────────────────────
     reg_marginals:     float = 1.0,
-    epsilon:     int | float = 0,
+    epsilon:           float = 0.0,
     divergence:        str   = 'kl',
     unbalanced_solver: str   = 'mm',
     max_iter:          int   = 100,
@@ -522,7 +518,6 @@ def pairwise_align_unbalanced(
     sliceB_name: Optional[str] = None,
     overwrite: bool            = False,
     neighborhood_dissimilarity: str = 'jsd',
-    hard_assignment: bool      = False,
     **kwargs,
 ) -> Union[NDArray[np.floating],
            Tuple[NDArray[np.floating], float, float, float, float]]:
@@ -698,9 +693,6 @@ def pairwise_align_unbalanced(
     )
 
     pi = np.asarray(pi_samp, dtype=np.float64)
-
-    if hard_assignment:
-        pi = _hard_assignment_from_coupling(pi)
 
     # ── Log ───────────────────────────────────────────────────────────────────
     linear_cost = float(log_dict.get('linear_cost', 0.0))

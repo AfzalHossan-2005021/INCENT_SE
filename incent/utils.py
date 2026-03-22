@@ -16,6 +16,62 @@ from ot.utils import list_to_array, get_backend
 from ot.unbalanced import sinkhorn_unbalanced
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dtype unification helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _unify_dtypes(*tensors, nx):
+    """
+    Cast all tensors to the canonical dtype for the given OT backend.
+
+    Rule
+    ----
+    TorchBackend (GPU or CPU torch): float32
+        - Standard for GPU computation; avoids "expected float got double"
+          errors from torch.matmul when upstream code mixes float32 and
+          float64 arrays.
+    NumpyBackend: float64
+        - Standard for OT numerical precision on CPU.
+
+    This function is called at the entry point of fused_gromov_wasserstein_incent
+    so that every input — regardless of how it was created upstream — is
+    normalised before any computation begins.
+
+    Parameters
+    ----------
+    *tensors : sequence of torch.Tensor or np.ndarray — inputs to normalise.
+    nx       : OT backend.
+
+    Returns
+    -------
+    Tuple of normalised tensors, same length and order as *tensors.
+    """
+    if isinstance(nx, ot.backend.TorchBackend):
+        # GPU canonical dtype: float32
+        out = []
+        for t in tensors:
+            if t is None:
+                out.append(None)
+            elif isinstance(t, torch.Tensor):
+                out.append(t.to(dtype=torch.float32))
+            else:
+                # numpy → float32 tensor, preserving device of first tensor arg
+                arr = np.asarray(t, dtype=np.float32)
+                out.append(torch.from_numpy(arr))
+        return tuple(out)
+    else:
+        # CPU canonical dtype: float64
+        out = []
+        for t in tensors:
+            if t is None:
+                out.append(None)
+            elif isinstance(t, np.ndarray):
+                out.append(t.astype(np.float64) if t.dtype != np.float64 else t)
+            else:
+                out.append(np.asarray(t, dtype=np.float64))
+        return tuple(out)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Sparse / dense helpers
 # ═════════════════════════════════════════════════════════════════════════════
@@ -274,12 +330,23 @@ def fused_gromov_wasserstein_incent(
     p0, q0, C10, C20, M10, M20 = p, q, C1, C2, M1, M2
     nx   = get_backend(p0, q0, C10, C20, M10, M20)
 
+    # ── Dtype unification ──────────────────────────────────────────────────────
+    # Normalise all inputs to float32 (GPU/TorchBackend) or float64 (CPU/Numpy).
+    # Upstream code may produce mixed dtypes (e.g. float32 cosine distance +
+    # float64 cell-type mask, or float64 JSD loaded from cache on GPU).
+    # Without this guard, nx.dot(C1, G) raises:
+    #   RuntimeError: expected mat1 and mat2 to have the same dtype
+    M1, M2, C1, C2, p, q = _unify_dtypes(M1, M2, C1, C2, p, q, nx=nx)
+    if G_init is not None:
+        G_init, = _unify_dtypes(G_init, nx=nx)
+
     if G_init is None:
         G0 = p[:, None] * q[None, :]
     else:
         s  = nx.sum(G_init)
         G0 = G_init / (s if s > 0 else 1.0)
         if use_gpu:
+            # G_init was cast to float32 by _unify_dtypes above — safe to move to GPU.
             G0 = G0.cuda()
 
     # GW regularisation functions (square loss)

@@ -272,11 +272,16 @@ def pairwise_align_se(
 
         # Combine all linear costs into one matrix for the FGW solver
         # M_total = M1 + eta*M_topo   (M2 is handled separately inside FGW as gamma*M2)
-        M1_np     = _to_np(M1)
-        M_comb_np = M1_np + eta * M_topo_np
-        M_combined = nx.from_numpy(M_comb_np)
+        # Both M1_np and M_topo_np are float64/float32 numpy arrays; normalise to
+        # float32 on GPU (matches D_A/D_B from _preprocess) or float64 on CPU.
+        M1_np     = _to_np(M1)                                    # float64 numpy
+        M_topo_np = M_topo_np.astype(np.float32)                  # fingerprint_cost → float32
+        M_comb_np = M1_np.astype(np.float32) + eta * M_topo_np   # float32 numpy
         if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-            M_combined = M_combined.cuda()
+            import torch as _torch
+            M_combined = _torch.from_numpy(M_comb_np).cuda()      # float32 on GPU
+        else:
+            M_combined = nx.from_numpy(M_comb_np.astype(np.float64))  # float64 on CPU
         print(f"[INCENT-SE] M_topo added (eta={eta}).")
     else:
         M_combined = M1
@@ -593,11 +598,14 @@ def pairwise_align_spatiotemporal(
     sliceA = p['sliceA']
     sliceB = p['sliceB']
 
-    # Replace M1 with M_latent (latent cosine cost from cVAE)
-    M_latent_np = latent_cost(sliceA, sliceB, model)
-    M1_latent   = nx.from_numpy(M_latent_np.astype(np.float64))
+    # Replace M1 with M_latent (latent cosine cost from cVAE).
+    # latent_cost() returns float32; normalise to the backend canonical dtype.
+    M_latent_np = latent_cost(sliceA, sliceB, model)   # float32 numpy
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-        M1_latent = M1_latent.cuda()
+        import torch as _torch
+        M1_latent = _torch.from_numpy(M_latent_np).cuda()         # float32 on GPU
+    else:
+        M1_latent = nx.from_numpy(M_latent_np.astype(np.float64)) # float64 on CPU
     logFile.write(f"M_latent: shape={M_latent_np.shape}  "
                   f"min={M_latent_np.min():.4f}  max={M_latent_np.max():.4f}\n")
 
@@ -619,9 +627,13 @@ def pairwise_align_spatiotemporal(
     else:
         M1_combined_np = M_latent_np
 
-    M1_combined = nx.from_numpy(M1_combined_np.astype(np.float64))
+    # M_topo_np (float32) + M_latent_np (float32) → float32 numpy sum.
+    # Then push to backend canonical dtype.
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-        M1_combined = M1_combined.cuda()
+        import torch as _torch
+        M1_combined = _torch.from_numpy(M1_combined_np).cuda()         # float32 on GPU
+    else:
+        M1_combined = nx.from_numpy(M1_combined_np.astype(np.float64)) # float64 on CPU
 
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 4: Block Coordinate Descent (BCD) — OT + LDDMM + Growth
@@ -652,9 +664,15 @@ def pairwise_align_spatiotemporal(
         # ── Block A: update OT plan π ──────────────────────────────────────
         # Use the current deformed D_B(φ) in the GW term.
         # The latent + topology cost M1_combined is fixed (does not depend on φ).
-        D_B_t = nx.from_numpy(D_B_current)
+        # D_B_current is float64 numpy (from deformed_distances).
+        # Cast to float32 on GPU to match D_A (which is float32 from _preprocess).
+        # _unify_dtypes in fused_gromov_wasserstein_incent is a safety net, but
+        # fixing it here avoids a silent re-cast inside the hot solver loop.
         if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-            D_B_t = D_B_t.cuda()
+            import torch as _torch
+            D_B_t = _torch.from_numpy(D_B_current.astype(np.float32)).cuda()
+        else:
+            D_B_t = nx.from_numpy(D_B_current)
 
         pi, logw = fused_gromov_wasserstein_incent(
             M1_combined,
