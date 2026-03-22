@@ -531,10 +531,10 @@ def pairwise_align_bispa(
     lambda_target=0.1,
     contiguity_sigma=None,
     # FUGW
-    base_reg_marginals=1.0,
-    epsilon=0.0,
+    base_reg_marginals=0.1,
+    epsilon=0.01,
     divergence="kl",
-    unbalanced_solver="mm",
+    unbalanced_solver="sinkhorn",
     max_iter_fugw=100,
     # Pose
     rough_grid_size=256,
@@ -598,7 +598,7 @@ def pairwise_align_bispa(
     lambda_spatial : float, default 0.1 -- source-side contiguity weight.
     lambda_target  : float, default 0.1 -- target-side contiguity weight.
 
-    base_reg_marginals : float, default 1.0
+    base_reg_marginals : float, default 0.1
         Base KL marginal relaxation. Scaled per-side by overlap fractions:
           rho_A = base_reg * s_A  (where s_A = matched A cells / n_A)
           rho_B = base_reg * s_B  (where s_B = matched B cells / n_B)
