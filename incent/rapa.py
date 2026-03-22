@@ -830,10 +830,10 @@ def pairwise_align_rapa(
     lambda_target: float = 0.1,
     contiguity_sigma: Optional[float] = None,
     # ── FUGW unbalanced solver ─────────────────────────────────────────────
-    reg_marginals: float = 1.0,
-    epsilon: float = 0.0,
+    reg_marginals: float = 0.1,
+    epsilon: float = 0.01,
     divergence: str = 'kl',
-    unbalanced_solver: str = 'mm',
+    unbalanced_solver: str = 'sinkhorn',
     max_iter_fugw: int = 100,
     # ── cVAE for cross-timepoint ────────────────────────────────────────────
     cvae_model=None,
@@ -902,11 +902,11 @@ def pairwise_align_rapa(
     lambda_spatial : float, default 0.1 — source-side contiguity weight.
     lambda_target  : float, default 0.1 — target-side contiguity weight.
 
-    reg_marginals : float, default 1.0
+    reg_marginals : float, default 0.1
         KL penalty on marginal violations in FUGW.
         Lower → more partial matching allowed.
         s_prior is used to scale this automatically.
-    epsilon : float, default 0.0 — Sinkhorn regularisation (0 = exact MM solver).
+    epsilon : float, default 0.01 — Sinkhorn regularisation (0 = exact MM solver).
 
     cvae_model / cvae_path : pre-trained cVAE for cross-timepoint expression cost.
     cvae_epochs : int — epochs for on-the-fly cVAE training.
