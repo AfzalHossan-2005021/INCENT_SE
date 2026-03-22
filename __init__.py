@@ -60,6 +60,9 @@ from .incent import (
     estimate_deformation,
     deformed_distances,
     estimate_growth_vector,
+
+# ── GPU utilities ───────────────────────────────────────────────────────────────
+    resolve_device
 )
 
 __all__ = [
@@ -99,4 +102,6 @@ __all__ = [
     'estimate_deformation',
     'deformed_distances',
     'estimate_growth_vector',
+    # GPU utilities
+    'resolve_device',
 ]

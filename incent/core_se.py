@@ -265,7 +265,7 @@ def pairwise_align_se(
             slice_name=f"{sliceB_name}_se" if sliceB_name else "B_se",
             overwrite=overwrite, verbose=gpu_verbose,
         )
-        M_topo_np = fingerprint_cost(fp_A, fp_B, metric=topo_metric)
+        M_topo_np = fingerprint_cost(fp_A, fp_B, metric=topo_metric, use_gpu=use_gpu)
         logFile.write(f"M_topo: shape={M_topo_np.shape}  "
                       f"min={M_topo_np.min():.4f}  max={M_topo_np.max():.4f}  "
                       f"eta={eta}\n")
@@ -350,7 +350,8 @@ def pairwise_align_se(
         pi_np = _to_np(pi)
         for _ in range(10):
             from .contiguity import contiguity_gradient
-            grad = lambda_spatial * contiguity_gradient(pi_np, W_A, D_B_dense)
+            grad = lambda_spatial * contiguity_gradient(pi_np, W_A, D_B_dense,
+                                                        use_gpu=use_gpu)
             # Project update onto the transport polytope: subtract scaled gradient
             # and re-normalise rows to sum to a_i
             a_np = _to_np(a)
@@ -613,7 +614,7 @@ def pairwise_align_spatiotemporal(
             cache_path=filePath,
             slice_name=f"{sliceB_name}_st" if sliceB_name else "B_st",
             overwrite=overwrite, verbose=gpu_verbose)
-        M_topo_np = fingerprint_cost(fp_A, fp_B, metric='cosine')
+        M_topo_np = fingerprint_cost(fp_A, fp_B, metric='cosine', use_gpu=use_gpu)
         M1_combined_np = M_latent_np + eta * M_topo_np
     else:
         M1_combined_np = M_latent_np
@@ -689,11 +690,13 @@ def pairwise_align_spatiotemporal(
             lambda_v=lambda_v,
             lr=lddmm_lr,
             n_iter=lddmm_n_iter,
+            use_gpu=use_gpu,
             verbose=False,
         )
 
         # Update D_B using the deformed coordinates
-        D_B_current = deformed_distances(coords_B_np, phi, normalise=True)
+        D_B_current = deformed_distances(coords_B_np, phi, normalise=True,
+                                         use_gpu=use_gpu)
 
         # Re-normalise D_B_current to match the shared scale of D_A
         # (D_A was normalised by max(D_B_original) in _preprocess)

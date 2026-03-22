@@ -13,6 +13,10 @@ INCENT-SE extends the original INCENT with:
     - Conditional VAE for drift-corrected expression embeddings
     - LDDMM diffeomorphic spatial deformation (BCD joint optimisation)
 
+GPU acceleration is available in fingerprint_cost, contiguity_gradient,
+all LDDMM operations, and the cVAE.  Pass use_gpu=True to any public
+function and GPU is used automatically when CUDA is available.
+
 Original INCENT functions are unchanged and still exported.
 """
 
@@ -75,41 +79,29 @@ from .lddmm import (
     estimate_growth_vector,
 )
 
+# ── GPU utilities (for user convenience) ─────────────────────────────────────
+from ._gpu import resolve_device
+
 __all__ = [
     # Original INCENT
-    'pairwise_align',
-    'pairwise_align_unbalanced',
-    'neighborhood_distribution',
-    'cosine_distance',
-    '_preprocess',
-    '_to_np',
-    'fused_gromov_wasserstein_incent',
-    'jensenshannon_divergence_backend',
-    'pairwise_msd',
-    'to_dense_array',
-    'extract_data_matrix',
+    'pairwise_align', 'pairwise_align_unbalanced',
+    'neighborhood_distribution', 'cosine_distance',
+    'fused_gromov_wasserstein_incent', 'jensenshannon_divergence_backend',
+    'pairwise_msd', 'to_dense_array', 'extract_data_matrix',
     # INCENT-SE alignment
-    'pairwise_align_se',
-    'pairwise_align_spatiotemporal',
+    'pairwise_align_se', 'pairwise_align_spatiotemporal',
     # Pose
-    'estimate_pose',
-    'apply_pose',
+    'estimate_pose', 'apply_pose',
     # Topology
-    'compute_fingerprints',
-    'fingerprint_cost',
+    'compute_fingerprints', 'fingerprint_cost',
     # Contiguity
-    'build_spatial_affinity',
-    'augment_fgw_gradient',
-    'contiguity_regulariser',
-    'contiguity_gradient',
-    'estimate_overlap_fraction',
+    'build_spatial_affinity', 'augment_fgw_gradient',
+    'contiguity_regulariser', 'contiguity_gradient', 'estimate_overlap_fraction',
     # cVAE
-    'INCENT_cVAE',
-    'train_cvae',
-    'latent_cost',
+    'INCENT_cVAE', 'train_cvae', 'latent_cost',
     # LDDMM
-    'LDDMMDeformation',
-    'estimate_deformation',
-    'deformed_distances',
-    'estimate_growth_vector',
+    'LDDMMDeformation', 'estimate_deformation',
+    'deformed_distances', 'estimate_growth_vector',
+    # GPU utility
+    'resolve_device',
 ]

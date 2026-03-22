@@ -1,122 +1,108 @@
 """
 lddmm.py — LDDMM Diffeomorphic Deformation for INCENT-SE Stage 5
 =================================================================
-Recovers the *spatial deformation field* between two slices from different
-developmental timepoints.
-
-Why diffeomorphic deformation?
--------------------------------
-Between timepoints the brain undergoes growth, folding, and regional
-expansion.  The transformation is NOT a simple rigid rotation + translation.
-We need a *diffeomorphism* φ: ℝ² → ℝ² — a smooth, invertible, continuously
-differentiable map that can model realistic tissue deformation.
+Recovers the spatial deformation field between two slices from different
+developmental timepoints using Large Deformation Diffeomorphic Metric Mapping.
 
 What is LDDMM?
 --------------
-Large Deformation Diffeomorphic Metric Mapping (LDDMM) models the
-diffeomorphism as the *flow* of a time-varying velocity field:
+The diffeomorphism φ is the flow of a stationary velocity field v:
+    φ(y) = y + Σ_{t=1}^{T} v(y_t) / T    (Euler integration)
+    v(x)  = Σ_j  K(x, c_j) · α_j         (kernel interpolation)
 
-    dφ_t / dt = v_t(φ_t),  φ_0 = Identity
+K is a Gaussian RKHS kernel with bandwidth σ_v that controls deformation
+smoothness.  α are the momentum vectors at control points c (= cell locations
+of sliceB, subsampled to ≤ 2000 for memory efficiency).
 
-The endpoint φ = φ_1 is our deformation.  The velocity field v_t lives in
-a Reproducing Kernel Hilbert Space (RKHS) with a Gaussian kernel:
+The deformation minimises:
+    E(φ) = Σ_{i,j} π_{ij} ||φ(y_j) - x_i||²   +   λ_V · ||v||²_V
 
-    ||v||²_V = Σ_{t} ∫ v_t(x) K^{-1} v_t(x) dx
+GPU acceleration
+----------------
+All matrix-heavy operations use torch tensors on the chosen device:
 
-This RKHS norm penalises fast-changing or spatially rough deformations,
-so the recovered φ is guaranteed to be smooth and biologically plausible.
+  _gaussian_kernel   : (n, m) distance matrix + exp — pure matmul, big GPU win.
+  velocity_at        : kernel @ alpha — (n×m) @ (m×2).
+  apply (Euler loop) : T repeated kernel matmuls.
+  _transport_loss    : vectorised O(n_B × n_A) computation on GPU.
+  deformed_distances : (n_B × n_B) pairwise distance on GPU.
 
-Adaptation for INCENT-SE
-------------------------
-In STalign's original formulation, the deformation is driven by minimising
-the dissimilarity between two density *images*.  We replace that image-loss
-with the OT-plan transport loss:
-
-    E_transport(φ) = Σ_{i,j} π_{ij} · ||φ(y_j) - x_i||²
-
-where π is the current transport plan (from the FGW step), x_i are cell
-coordinates in sliceA, and y_j are cell coordinates in sliceB.
-
-This means: "deform sliceB's coordinates so that each cell j in B lands
-as close as possible to its matched cell i in A, weighted by how strongly
-they are matched (π_ij)".
+The ``LDDMMDeformation`` class stores alpha as a torch tensor on the target
+device during training.  ``apply`` always returns a CPU numpy array so
+downstream code does not need to be GPU-aware.
 
 Public API
 ----------
-LDDMMDeformation          — class that holds the velocity field and computes φ
-estimate_deformation(     — main function: given π, x_A, y_B → updates φ
-    pi, coords_A, coords_B, sigma_v, n_steps, lr, n_iter)
-apply_deformation(coords, phi) → deformed coords
-deformed_distances(coords_B, phi, normalise=True) → D_B_deformed
+LDDMMDeformation          — stores the velocity field; apply/rkhs ops.
+estimate_deformation(...)  → LDDMMDeformation
+deformed_distances(...)    → (n_B, n_B) np.ndarray
+estimate_growth_vector(...)→ (n_B,) np.ndarray
 """
 
 import numpy as np
-from typing import Optional, Tuple
+from typing import Tuple
+from ._gpu import resolve_device, to_torch, to_numpy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: Gaussian RKHS kernel
+# Gaussian kernel — device-aware (numpy or torch)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gaussian_kernel(
-    x: np.ndarray,
-    y: np.ndarray,
-    sigma: float,
-) -> np.ndarray:
+def _gaussian_kernel(x, y, sigma: float):
     """
     Evaluate the Gaussian kernel matrix K(x, y).
 
     K[i,j] = exp( -||x_i - y_j||² / (2σ²) )
 
-    This kernel defines the smoothness of the velocity field.
-    σ (sigma_v) controls the spatial scale of deformations:
-      - Large σ: smooth, global deformations (brain-scale growth).
-      - Small σ: fine-grained, local deformations (cell-level adjustment).
-    For MERFISH brain, σ ≈ 200–500 μm is a good starting point.
+    Accepts either numpy arrays (CPU) or torch tensors (GPU).
+    Returns the same type as the inputs.
 
     Parameters
     ----------
-    x : (n, 2) float array — first set of points.
-    y : (m, 2) float array — second set of points.
-    sigma : float — kernel bandwidth.
+    x     : (n, 2) array/tensor — first set of points.
+    y     : (m, 2) array/tensor — second set of points.
+    sigma : float — kernel bandwidth (spatial scale of deformation).
 
     Returns
     -------
-    K : (n, m) float64 array.
+    K : (n, m) — same type and device as x.
     """
-    # ||x_i - y_j||² = ||x_i||² + ||y_j||² - 2 x_i·y_j
-    sq_x = (x ** 2).sum(axis=1, keepdims=True)   # (n, 1)
-    sq_y = (y ** 2).sum(axis=1, keepdims=True).T  # (1, m)
-    D2   = sq_x + sq_y - 2.0 * (x @ y.T)         # (n, m)
-    D2   = np.maximum(D2, 0.0)                    # numerical safety
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            sq_x = (x ** 2).sum(dim=1, keepdim=True)    # (n, 1)
+            sq_y = (y ** 2).sum(dim=1, keepdim=True).T   # (1, m)
+            D2   = (sq_x + sq_y - 2.0 * x @ y.T).clamp(min=0.0)
+            return torch.exp(-D2 / (2.0 * sigma ** 2))
+    except ImportError:
+        pass
+
+    # Numpy path
+    sq_x = (x ** 2).sum(axis=1, keepdims=True)
+    sq_y = (y ** 2).sum(axis=1, keepdims=True).T
+    D2   = np.maximum(sq_x + sq_y - 2.0 * (x @ y.T), 0.0)
     return np.exp(-D2 / (2.0 * sigma ** 2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2: LDDMMDeformation class
+# LDDMMDeformation class — GPU-aware
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LDDMMDeformation:
     """
     Parametric LDDMM deformation defined by momentum vectors at control points.
 
-    We use the *stationary* (time-constant) velocity field approximation for
-    efficiency.  The velocity field is parameterised by momentum vectors
-    α_j at control points c_j (which we place at the cell locations of sliceB):
-
+    The velocity field is:
         v(x) = Σ_j  K(x, c_j) · α_j
 
-    The deformation is then Euler-integrated:
-        φ(y) = y + Σ_{t=0}^{T-1} v_t(y)  ·  (1/T)
-
-    For large deformations more steps T are needed (at the cost of computation).
+    and is Euler-integrated to give the diffeomorphism φ.
 
     Parameters
     ----------
     control_points : (m, 2) float array — positions where momentum is defined.
-        Typically set to the cell coordinates of sliceB.
-    sigma_v : float — kernel bandwidth (spatial scale of deformation).
-    n_steps : int — number of Euler integration steps.
+    sigma_v        : float — Gaussian kernel bandwidth.
+    n_steps        : int   — Euler integration steps (more = smoother φ).
+    device         : str   — 'cuda' or 'cpu'.  All internal tensors live here.
     """
 
     def __init__(
@@ -124,149 +110,195 @@ class LDDMMDeformation:
         control_points: np.ndarray,
         sigma_v: float,
         n_steps: int = 5,
+        device: str = 'cpu',
     ):
-        self.control_points = control_points.astype(np.float64)
-        self.sigma_v        = sigma_v
-        self.n_steps        = n_steps
-        m                   = len(control_points)
+        self.sigma_v  = sigma_v
+        self.n_steps  = n_steps
+        self.device   = device
 
-        # Momentum α: shape (m, 2) — one 2-D vector per control point
-        # Initialised to zero (identity deformation at the start)
-        self.alpha          = np.zeros((m, 2), dtype=np.float64)
+        ctrl_np = control_points.astype(np.float64)
+        m       = len(ctrl_np)
 
-        # Pre-compute kernel matrix between control points (used for RKHS norm)
-        self._K_cc = _gaussian_kernel(control_points, control_points, sigma_v)
+        if device == 'cuda':
+            # Store on GPU for fully-GPU gradient descent loop
+            self._ctrl = to_torch(ctrl_np, device)
+            try:
+                import torch
+                self.alpha = torch.zeros((m, 2), dtype=torch.float64, device=device)
+            except ImportError:
+                self.alpha = np.zeros((m, 2), dtype=np.float64)
+        else:
+            # CPU: keep everything as numpy — no torch dependency needed
+            self._ctrl = ctrl_np
+            self.alpha = np.zeros((m, 2), dtype=np.float64)
 
-    def velocity_at(self, query_points: np.ndarray) -> np.ndarray:
+        # Pre-compute kernel matrix at control points (device-agnostic)
+        self._K_cc = _gaussian_kernel(self._ctrl, self._ctrl, sigma_v)
+
+    def velocity_at(self, query_points):
         """
-        Evaluate velocity field v(x) = Σ_j K(x, c_j) · α_j at query_points.
+        Evaluate v(x) = K(x, ctrl) · α at query_points.
 
         Parameters
         ----------
-        query_points : (n, 2) float array.
+        query_points : (n, 2) tensor/array on self.device.
 
         Returns
         -------
-        v : (n, 2) float array — velocity vectors at each query point.
+        v : (n, 2) — same type and device as query_points.
         """
-        K  = _gaussian_kernel(query_points, self.control_points, self.sigma_v)
-        # K: (n, m),  alpha: (m, 2)  →  K @ alpha: (n, 2)
+        K = _gaussian_kernel(query_points, self._ctrl, self.sigma_v)
         return K @ self.alpha
 
     def apply(self, coords: np.ndarray) -> np.ndarray:
         """
-        Apply the deformation φ to a set of coordinates.
-
-        Uses Euler integration with `n_steps` steps:
-            y_{t+1} = y_t + v(y_t) / n_steps
+        Apply φ to coordinates via Euler integration.  Always returns numpy.
 
         Parameters
         ----------
-        coords : (n, 2) float array — points to deform.
+        coords : (n, 2) float — points to deform (any device/dtype).
 
         Returns
         -------
-        deformed : (n, 2) float array — φ(coords).
+        deformed : (n, 2) float64 numpy array — φ(coords).
         """
-        y = coords.astype(np.float64).copy()
-        dt = 1.0 / self.n_steps
+        coords_f = coords.astype(np.float64)
+        dt       = 1.0 / self.n_steps
+
+        if self.device == 'cuda':
+            y = to_torch(coords_f, self.device)
+            for _ in range(self.n_steps):
+                y = y + dt * self.velocity_at(y)
+            return to_numpy(y)
+
+        # CPU: stay in numpy the whole way
+        y = coords_f.copy()
         for _ in range(self.n_steps):
-            v  = self.velocity_at(y)
-            y  = y + dt * v
+            y = y + dt * self.velocity_at(y)
         return y
 
     def rkhs_norm_squared(self) -> float:
         """
-        Compute ||v||²_V = α^T · K_cc · α (the RKHS regularisation term).
-
-        This penalises large deformations — gradient of this w.r.t. α
-        is 2 · K_cc · α, which drives α towards 0 (identity deformation).
+        ||v||²_V = α^T · K_cc · α  (RKHS regularisation term).
 
         Returns
         -------
-        float — RKHS norm squared (scalar).
+        float.
         """
-        # (m, 2) · (m, m) · (m, 2) → scalar
-        # = Σ_{d=0,1}  alpha[:,d]^T · K_cc · alpha[:,d]
+        try:
+            import torch
+            if isinstance(self.alpha, torch.Tensor):
+                val = (self.alpha * (self._K_cc @ self.alpha)).sum()
+                return float(val.item())
+        except ImportError:
+            pass
         return float(np.einsum('id,ij,jd->', self.alpha, self._K_cc, self.alpha))
 
-    def rkhs_norm_gradient(self) -> np.ndarray:
+    def rkhs_norm_gradient(self):
         """
-        Gradient of ||v||²_V w.r.t. α.
-
-        ∂||v||²_V / ∂α = 2 · K_cc · α
+        ∂||v||²_V / ∂α = 2 · K_cc · α.
 
         Returns
         -------
-        (m, 2) float64 — gradient w.r.t. momentum α.
+        (m, 2) — same type and device as self.alpha.
         """
-        return 2.0 * self._K_cc @ self.alpha
+        return 2.0 * (self._K_cc @ self.alpha)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: Transport loss and its gradient w.r.t. α
+# Transport loss — fully vectorised, GPU-accelerated
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _transport_loss(
+    phi: LDDMMDeformation,
+    pi,          # torch tensor (n_A, n_B) on phi.device
+    coords_A,    # torch tensor (n_A, 2)  on phi.device
+    coords_B,    # torch tensor (n_B, 2)  on phi.device
+) -> Tuple:
+    """
+    Compute E_transport = Σ_{i,j} π_{ij} ||φ(y_j) - x_i||² and ∂E/∂α.
+
+    Fully vectorised (no Python j-loop).  All tensors on phi.device.
+
+    Vectorised loss formula
+    -----------------------
+    diff²[i,j] = ||y_j^φ - x_i||²
+               = ||y_j^φ||² − 2 y_j^φ · x_i + ||x_i||²
+    loss = Σ_{i,j} π_{ij} · diff²[i,j]
+         = (π · sq_yφ.T).sum() − 2(π ⊙ (x @ yφ.T).T).sum() + (π · sq_x).sum()
+
+    Re-expressed in matrix form (memory-efficient — only O(n_B + n_A) overhead):
+        pi_col = π^T · 1          (n_B,) marginal
+        Σ_i π_{ij} x_i = π^T @ x (n_B, 2) weighted centroid
+        residual_j = pi_col_j · y_j^φ − (π^T @ x)_j    (n_B, 2)
+        loss = sq_yφ · pi_col − 2 · diag(yφ @ (π^T @ x)^T) + sq_x · π^T·1
+             = (pi_col * sq_yφ).sum() + sq_x @ pi_col − 2*(y_phi * weighted_xA).sum()
+
+    Gradient ∂E/∂α = 2 · K(y^φ, c)^T · residuals   (m, 2)
+
+    Parameters  (all torch tensors on phi.device)
+    ----------
+    phi      : LDDMMDeformation.
+    pi       : (n_A, n_B) float64.
+    coords_A : (n_A, 2)   float64.
+    coords_B : (n_B, 2)   float64 — original (pre-deformation) sliceB coords.
+
+    Returns
+    -------
+    (loss: float,  grad_alpha: (m, 2) tensor on phi.device)
+    """
+    import torch
+
+    y_phi = phi.apply(to_numpy(coords_B))          # always returns numpy
+    y_phi = to_torch(y_phi, phi.device)            # back to device
+
+    pi_col         = pi.sum(dim=0)                 # (n_B,)
+    weighted_xA    = pi.T @ coords_A               # (n_B, 2) = Σ_i π_{ij} x_i
+
+    sq_yφ = (y_phi ** 2).sum(dim=1)               # (n_B,)
+    sq_xA = (coords_A ** 2).sum(dim=1)            # (n_A,)
+
+    loss = (pi_col * sq_yφ).sum() \
+         + (sq_xA @ pi.sum(dim=1)) \
+         - 2.0 * (y_phi * weighted_xA).sum()
+
+    # Residuals for gradient: r_j = pi_col_j · y_j^φ − Σ_i π_{ij} x_i
+    residuals = pi_col.unsqueeze(1) * y_phi - weighted_xA   # (n_B, 2)
+
+    K_yB_c    = _gaussian_kernel(y_phi, phi._ctrl, phi.sigma_v)  # (n_B, m)
+    grad_alpha = 2.0 * K_yB_c.T @ residuals                      # (m, 2)
+
+    return float(loss.item()), grad_alpha
+
+
+def _transport_loss_numpy(
     phi: LDDMMDeformation,
     pi: np.ndarray,
     coords_A: np.ndarray,
     coords_B: np.ndarray,
 ) -> Tuple[float, np.ndarray]:
-    """
-    Compute the transport loss E_transport and its gradient w.r.t. α.
+    """CPU (numpy) fallback for _transport_loss."""
+    y_phi = phi.apply(coords_B)                    # (n_B, 2) numpy
 
-    E_transport(φ) = Σ_{i,j} π_{ij} · ||φ(y_j) - x_i||²
+    pi_col      = pi.sum(axis=0)                   # (n_B,)
+    weighted_xA = pi.T @ coords_A                  # (n_B, 2)
 
-    Gradient derivation
-    -------------------
-    Let y_j^φ = φ(y_j) = y_j + Σ_{t} v_t(y_j^{t-1}) / T   (Euler approximation)
+    sq_yφ = (y_phi ** 2).sum(axis=1)
+    sq_xA = (coords_A ** 2).sum(axis=1)
 
-    For the stationary velocity field approximation:
-        ∂E / ∂α_k  =  Σ_{i,j} π_{ij} · 2·(y_j^φ - x_i) · K(y_j^φ, c_k)
+    loss = ((pi_col * sq_yφ).sum()
+            + sq_xA @ pi.sum(axis=1)
+            - 2.0 * (y_phi * weighted_xA).sum())
 
-    In matrix form (using the deformed positions y^φ):
-        ∂E / ∂α  =  2 · K(y^φ, c)^T · (Σ_i π_{ij} (y_j^φ - x_i))_{j}
-
-    Parameters
-    ----------
-    phi : LDDMMDeformation — current deformation.
-    pi : (n_A, n_B) float array — current transport plan.
-    coords_A : (n_A, 2) float array — cell positions in sliceA.
-    coords_B : (n_B, 2) float array — cell positions in sliceB (control points).
-
-    Returns
-    -------
-    loss : float — E_transport value.
-    grad_alpha : (m, 2) float array — ∂E/∂α.
-    """
-    # Apply current deformation to sliceB coordinates
-    y_phi = phi.apply(coords_B)          # (n_B, 2) — deformed positions
-
-    # For each j in B: weighted residual Σ_i π_{ij} (y_j^φ - x_i)
-    # = y_j^φ · (Σ_i π_{ij})  -  Σ_i π_{ij} · x_i
-    pi_col_sum = pi.sum(axis=0)                       # (n_B,) = Σ_i π_{ij}
-    weighted_target = pi.T @ coords_A                 # (n_B, 2) = Σ_i π_{ij} x_i
-    residuals = (pi_col_sum[:, None] * y_phi          # Σ_i π_{ij} · y_j^φ
-                 - weighted_target)                   # minus Σ_i π_{ij} · x_i
-
-    # Transport loss: Σ_{i,j} π_{ij} ||y_j^φ - x_i||²
-    # Expand: Σ_j Σ_i π_{ij} (||y_j^φ||² - 2 y_j^φ·x_i + ||x_i||²)
-    loss = 0.0
-    for j in range(len(coords_B)):
-        diff_j = y_phi[j] - coords_A                  # (n_A, 2)
-        loss  += (pi[:, j] * (diff_j ** 2).sum(axis=1)).sum()
-
-    # Gradient w.r.t. α via chain rule through the Euler integration
-    # Using the approximation: ∂φ/∂α ≈ K(y_j^φ, control_points)
-    K_yB_c   = _gaussian_kernel(y_phi, phi.control_points, phi.sigma_v)  # (n_B, m)
-    grad_alpha = 2.0 * K_yB_c.T @ residuals                              # (m, 2)
+    residuals  = pi_col[:, None] * y_phi - weighted_xA   # (n_B, 2)
+    K_yB_c    = _gaussian_kernel(y_phi, to_numpy(phi._ctrl), phi.sigma_v)
+    grad_alpha = 2.0 * K_yB_c.T @ residuals              # (m, 2)
 
     return float(loss), grad_alpha
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC FUNCTION: estimate_deformation
+# PUBLIC: estimate_deformation — GPU-accelerated gradient descent
 # ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_deformation(
@@ -279,68 +311,49 @@ def estimate_deformation(
     lr: float = 0.01,
     n_iter: int = 100,
     tol: float = 1e-6,
+    use_gpu: bool = False,
     verbose: bool = False,
 ) -> LDDMMDeformation:
     """
-    Estimate the LDDMM diffeomorphism φ that maps sliceB's cells onto sliceA.
+    Estimate the LDDMM diffeomorphism φ mapping sliceB coordinates onto sliceA.
 
-    This is the Stage 5 Block B update in INCENT-SE.  Given the current
-    OT plan π (from the FGW step), we find the smooth deformation field
-    that minimises the transport-weighted distance:
+    Given the current OT plan π, minimises:
+        E(φ) = Σ_{i,j} π_{ij} ||φ(y_j) - x_i||²   +   λ_V · ||v||²_V
 
-        E(φ) = Σ_{i,j} π_{ij} ||φ(y_j) - x_i||²  +  λ_V · ||v||²_V
+    The first term pulls deformed sliceB cells towards their matched sliceA
+    cells.  The RKHS norm ensures the deformation is smooth.
 
-    The first term pulls the deformed sliceB coordinates towards their matched
-    sliceA positions.  The second term (RKHS norm) ensures the deformation
-    is smooth and biologically plausible.
+    GPU acceleration
+    ----------------
+    All internal tensors (alpha, kernel matrices, gradients) live on the GPU
+    when ``use_gpu=True`` and CUDA is available.  The gradient descent loop
+    runs entirely on GPU — only the final deformation object is returned to
+    CPU (via ``phi.apply()`` which always returns numpy).
 
     Parameters
     ----------
-    pi : (n_A, n_B) float array — OT plan from the FGW step.
-        Larger π[i,j] means cell i in A and cell j in B are matched more
-        strongly — so their distance after deformation is penalised more.
-    coords_A : (n_A, 2) float array — spatial coordinates of cells in sliceA.
-    coords_B : (n_B, 2) float array — spatial coordinates of cells in sliceB.
-        These are also used as the control points for the velocity field.
-    sigma_v : float
-        Kernel bandwidth for the RKHS velocity field.
-        Good range for MERFISH: 200–1000 μm.
-        Larger → smoother but less flexible deformation.
-    lambda_v : float, default 1.0
-        Weight of the RKHS regularisation term.
-        Larger → smaller, smoother deformation (closer to identity).
-        Smaller → larger deformations allowed.
-        If the two slices are from adjacent timepoints, try 0.5–2.0.
-        For widely-separated timepoints, lower to 0.1.
-    n_steps : int, default 5
-        Euler integration steps for the flow (more = more accurate flow).
-    lr : float, default 0.01
-        Gradient descent learning rate for the momentum α.
-    n_iter : int, default 100
-        Maximum number of gradient descent steps.
-    tol : float, default 1e-6
-        Convergence tolerance on relative loss change.
-    verbose : bool, default False
-        Print loss at each iteration.
+    pi       : (n_A, n_B) float — OT plan from the FGW step.
+    coords_A : (n_A, 2)   float — cell coordinates in sliceA.
+    coords_B : (n_B, 2)   float — cell coordinates in sliceB.
+    sigma_v  : float — RKHS kernel bandwidth.  For MERFISH: 200–1000 μm.
+    lambda_v : float, default 1.0 — RKHS regularisation weight.
+    n_steps  : int, default 5 — Euler integration steps per forward pass.
+    lr       : float, default 0.01 — gradient descent learning rate.
+    n_iter   : int, default 100 — maximum gradient steps.
+    tol      : float, default 1e-6 — relative loss convergence threshold.
+    use_gpu  : bool, default False.
+    verbose  : bool, default False.
 
     Returns
     -------
-    phi : LDDMMDeformation — the estimated deformation.
-        Use phi.apply(coords_B) to get the deformed coordinates.
-        Use deformed_distances(coords_B, phi) to get the updated D_B.
-
-    Notes
-    -----
-    For n_B = 15k cells the gradient involves a (15k × 15k) kernel matrix
-    which is memory-intensive.  We subsample control points to a random
-    subset of min(n_B, 2000) cells if n_B is large.
+    phi : LDDMMDeformation — use ``phi.apply(coords_B)`` for deformed coords.
     """
+    device   = resolve_device(use_gpu)
     coords_A = coords_A.astype(np.float64)
     coords_B = coords_B.astype(np.float64)
 
-    # ── Subsample control points if n_B is large ───────────────────────────
-    n_B      = len(coords_B)
-    max_ctrl = 2000
+    # ── Subsample control points (kernel matrix is O(m²)) ─────────────────
+    n_B, max_ctrl = len(coords_B), 2000
     if n_B > max_ctrl:
         idx_ctrl = np.random.choice(n_B, max_ctrl, replace=False)
         ctrl_pts = coords_B[idx_ctrl]
@@ -349,21 +362,35 @@ def estimate_deformation(
     else:
         ctrl_pts = coords_B
 
-    phi = LDDMMDeformation(ctrl_pts, sigma_v=sigma_v, n_steps=n_steps)
+    phi = LDDMMDeformation(ctrl_pts, sigma_v=sigma_v, n_steps=n_steps, device=device)
+
+    # ── Move constant tensors to device once ──────────────────────────────
+    use_torch = (device == 'cuda')
+    if use_torch:
+        import torch
+        pi_d  = to_torch(pi,       device, dtype=torch.float64)
+        cA_d  = to_torch(coords_A, device, dtype=torch.float64)
+        cB_d  = to_torch(coords_B, device, dtype=torch.float64)
+    else:
+        pi_d, cA_d, cB_d = pi, coords_A, coords_B
 
     prev_loss = np.inf
+
     for it in range(n_iter):
-        # ── Forward: compute transport loss + RKHS norm ─────────────────
-        E_t,  grad_t = _transport_loss(phi, pi, coords_A, coords_B)
-        E_v          = phi.rkhs_norm_squared()
-        grad_v       = phi.rkhs_norm_gradient()
+        if use_torch:
+            E_t,  grad_t = _transport_loss(phi, pi_d, cA_d, cB_d)
+        else:
+            E_t,  grad_t = _transport_loss_numpy(phi, pi_d, cA_d, cB_d)
+
+        E_v    = phi.rkhs_norm_squared()
+        grad_v = phi.rkhs_norm_gradient()
 
         total_loss = E_t + lambda_v * E_v
         total_grad = grad_t + lambda_v * grad_v
 
         if verbose and it % 10 == 0:
-            print(f"[lddmm] iter={it:4d}  E_transport={E_t:.4f}  "
-                  f"E_rkhs={E_v:.4f}  total={total_loss:.4f}")
+            print(f"[lddmm] it={it:4d}  E_t={E_t:.4f}  "
+                  f"E_v={E_v:.4f}  total={total_loss:.4f}")
 
         # ── Convergence check ─────────────────────────────────────────────
         rel_change = abs(total_loss - prev_loss) / (abs(prev_loss) + 1e-12)
@@ -373,57 +400,77 @@ def estimate_deformation(
             break
         prev_loss = total_loss
 
-        # ── Gradient descent step on α ────────────────────────────────────
-        # Simple gradient descent (for production use Adam or L-BFGS)
-        phi.alpha -= lr * total_grad
+        phi.alpha = phi.alpha - lr * total_grad
 
     return phi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC HELPER: deformed_distances
+# PUBLIC: deformed_distances — GPU-accelerated pairwise distance
 # ─────────────────────────────────────────────────────────────────────────────
 
 def deformed_distances(
     coords_B: np.ndarray,
     phi: LDDMMDeformation,
     normalise: bool = True,
+    use_gpu: bool = False,
 ) -> np.ndarray:
     """
-    Compute pairwise Euclidean distances between deformed sliceB coordinates.
+    Compute pairwise Euclidean distances of the deformed sliceB coordinates.
 
-    After estimating the deformation φ, the GW term in the next INCENT-SE
-    FGW iteration should use D_B(φ) = pairwise distances of φ(coords_B)
-    rather than the original D_B.  This is the "Block B → FGW" information
-    flow in the joint optimisation.
+    Used to update D_B in the BCD loop: the GW term should use D_B(φ) =
+    pairwise distances of φ(coords_B) rather than the original D_B.
+
+    GPU path
+    --------
+    The deformed coordinates y^φ = phi.apply(coords_B) are computed by
+    the LDDMMDeformation object (already GPU-aware).  The (n_B × n_B)
+    pairwise distance matrix is then computed via the identity:
+
+        ||y_i - y_j||² = ||y_i||² + ||y_j||² - 2 y_i·y_j
+
+    as a single matrix product on GPU — far faster than the naive (n, n, 2)
+    broadcast for large n.
 
     Parameters
     ----------
-    coords_B : (n_B, 2) float array — original sliceB cell coordinates.
-    phi : LDDMMDeformation — the estimated deformation.
-    normalise : bool, default True
-        If True, divide by max(D_B(φ)) for consistent shared-scale
-        normalisation with INCENT's D_A (which was already normalised).
+    coords_B  : (n_B, 2) float — original sliceB coordinates.
+    phi       : LDDMMDeformation — estimated deformation.
+    normalise : bool, default True — divide by max(D_B(φ)).
+    use_gpu   : bool, default False.
 
     Returns
     -------
-    D_B_deformed : (n_B, n_B) float64 array.
+    D_B_deformed : (n_B, n_B) float64 numpy array.
     """
-    y_phi    = phi.apply(coords_B)                          # (n_B, 2)
-    # Pairwise Euclidean: ||y_i^φ - y_j^φ||
-    diff     = y_phi[:, None, :] - y_phi[None, :, :]       # (n_B, n_B, 2)
-    D_B_def  = np.sqrt((diff ** 2).sum(axis=2))             # (n_B, n_B)
+    device = resolve_device(use_gpu)
+    y_phi  = phi.apply(coords_B)   # (n_B, 2) numpy — always returned by apply()
 
+    if device == 'cuda':
+        import torch
+        y   = to_torch(y_phi, device, dtype=torch.float32)
+        sq  = (y ** 2).sum(dim=1, keepdim=True)            # (n_B, 1)
+        D2  = (sq + sq.T - 2.0 * y @ y.T).clamp(min=0.0)  # (n_B, n_B)
+        D   = D2.sqrt()
+        if normalise:
+            m = D.max()
+            if m > 1e-12:
+                D = D / m
+        return D.cpu().numpy().astype(np.float64)
+
+    # ── CPU path ───────────────────────────────────────────────────────────
+    sq  = (y_phi ** 2).sum(axis=1, keepdims=True)
+    D2  = np.maximum(sq + sq.T - 2.0 * (y_phi @ y_phi.T), 0.0)
+    D   = np.sqrt(D2)
     if normalise:
-        m = D_B_def.max()
+        m = D.max()
         if m > 1e-12:
-            D_B_def /= m
-
-    return D_B_def.astype(np.float64)
+            D /= m
+    return D.astype(np.float64)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC HELPER: growth_vector
+# PUBLIC: estimate_growth_vector (trivial — no GPU needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_growth_vector(
@@ -432,34 +479,25 @@ def estimate_growth_vector(
     kappa: float = 0.1,
 ) -> np.ndarray:
     """
-    Estimate the per-cell growth vector ξ for the semi-relaxed OT formulation.
+    Estimate the per-cell growth vector ξ from the transport plan.
 
-    In the cross-timepoint OT, the target marginal is relaxed:
-        π^T · 1 ≈ ξ ⊙ b
-    where ξ[j] > 1 means cell j in sliceB has "more" mass than expected
-    (it proliferated or expanded) and ξ[j] < 1 means it contracted or
-    represents a dying population.
+    ξ[j] > 1 → cell j in sliceB proliferates / expands.
+    ξ[j] < 1 → cell j contracts / is dying.
+    ξ[j] ≈ 1 → stable population.
 
-    Estimation: ξ_j = (π^T · 1)[j] / b[j]
-    Regularised towards 1 by a prior ||ξ - 1||² with weight κ:
-        ξ_j = ((π^T · 1)[j] + κ · b[j]) / (b[j] + κ · b[j])
-            = ((π^T · 1)[j] / b[j] + κ) / (1 + κ)
+    Estimation: ξ_j = (π^T·1)[j] / b[j], regularised towards 1 by κ.
 
     Parameters
     ----------
-    pi : (n_A, n_B) float array — current transport plan.
-    b : (n_B,) float array — target marginal (uniform = 1/n_B).
-    kappa : float, default 0.1 — prior weight towards ξ=1 (no growth).
+    pi    : (n_A, n_B) float — transport plan.
+    b     : (n_B,) float    — target marginal.
+    kappa : float, default 0.1 — prior strength (larger → ξ closer to 1).
 
     Returns
     -------
-    xi : (n_B,) float array — growth vector.
-        xi > 1: proliferating regions.
-        xi < 1: contracting/apoptotic regions.
-        xi ≈ 1: stable populations.
+    xi : (n_B,) float64.
     """
-    pi_col = pi.sum(axis=0)                    # (n_B,) actual marginal
-    raw    = pi_col / (b + 1e-12)              # raw per-cell growth rate
-    # Regularise towards 1 (weak prior: growth is approximately 1)
+    pi_col = pi.sum(axis=0)
+    raw    = pi_col / (b + 1e-12)
     xi     = (raw + kappa) / (1.0 + kappa)
     return xi.astype(np.float64)
