@@ -71,6 +71,14 @@ from .cvae import (
     latent_cost,
 )
 
+# ── INCENT-SE: SEOT (SE(2)-OT EM: explicit transformation recovery) ──────────
+from .seot import (
+    pairwise_align_seot,
+    weighted_procrustes,
+    build_spatial_cost,
+    seot_em,
+)
+
 # ── INCENT-SE: RAPA (Region-Aware Partial Alignment) ─────────────────────────
 from .rapa import (
     pairwise_align_rapa,
@@ -81,6 +89,7 @@ from .rapa import (
     apply_region_translation,
     target_contiguity_gradient,
 )
+
 # ── INCENT-SE: BISPA (Bidirectional Symmetric Partial Alignment) ─────────────
 from .bispa import (
     pairwise_align_bispa,
@@ -122,6 +131,8 @@ __all__ = [
     'contiguity_regulariser', 'contiguity_gradient', 'estimate_overlap_fraction',
     # cVAE
     'INCENT_cVAE', 'train_cvae', 'latent_cost',
+    # SEOT
+    'pairwise_align_seot', 'weighted_procrustes', 'build_spatial_cost', 'seot_em',
     # BISPA (supersedes RAPA for the general case)
     'pairwise_align_bispa', 'decompose_slice', 'build_community_similarity',
     'hungarian_matching', 'recover_pose_matched', 'build_bidirectional_anchor',

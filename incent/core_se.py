@@ -551,17 +551,14 @@ def pairwise_align_spatiotemporal(
     #   (2) Balanced OT on a partial-overlap pair (use unbalanced FUGW)
     #   (3) No mechanism to choose the correct organ sub-region (use region matching)
     if use_rapa:
-        # BISPA supersedes RAPA: treats both slices symmetrically so either
-        # slice can be the larger one with multiple regions.
-        from .bispa import pairwise_align_bispa
-        result = pairwise_align_bispa(
+        # SEOT: SE(2)-OT EM -- jointly recovers rotation/translation AND
+        # cell correspondences. BISPA provides symmetry-breaking initialisation.
+        from .seot import pairwise_align_seot
+        result = pairwise_align_seot(
             sliceA=sliceA, sliceB=sliceB,
             alpha=alpha, beta=beta, gamma=gamma,
             radius=radius, filePath=filePath,
-            target_min_region_frac_A=target_min_region_frac,
-            target_min_region_frac_B=target_min_region_frac,
-            leiden_resolution_A=leiden_resolution,
-            leiden_resolution_B=leiden_resolution,
+            target_min_region_frac=target_min_region_frac,
             lambda_anchor=lambda_anchor,
             lambda_spatial=lambda_spatial,
             lambda_target=lambda_target,
@@ -578,10 +575,9 @@ def pairwise_align_spatiotemporal(
         )
         if return_obj:
             pi, diag = result
-            # 4-tuple matching the original BCD signature (pi, phi, xi, cost_history)
-            return pi, diag['sliceA_aligned'], diag, []
+            return pi, diag['sliceA_aligned'], diag, diag['residual_history']
         return result
-    # -- End BISPA dispatch (use_rapa=False falls through to original BCD) -----
+    # -- End SEOT dispatch (use_rapa=False falls through to original BCD) -----
 
     log_name = (f"{filePath}/log_st_{sliceA_name}_{sliceB_name}.txt"
                 if sliceA_name and sliceB_name else f"{filePath}/log_st.txt")

@@ -55,6 +55,12 @@ from .incent import (
     train_cvae,
     latent_cost,
 
+# ── INCENT-SE: SEOT (SE(2)-OT EM: explicit transformation recovery) ──────────
+    pairwise_align_seot,
+    weighted_procrustes,
+    build_spatial_cost,
+    seot_em,
+
 # ── INCENT-SE: Region-Aware Partial Alignment (RAPA) ───────────────────────────────────────────────
     pairwise_align_rapa,
     decompose_target,
@@ -115,6 +121,11 @@ __all__ = [
     'INCENT_cVAE',
     'train_cvae',
     'latent_cost',
+    # SEOT
+    'pairwise_align_seot',
+    'weighted_procrustes',
+    'build_spatial_cost',
+    'seot_em',
     # RAPA
     'pairwise_align_rapa',
     'decompose_target',
