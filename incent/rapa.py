@@ -160,8 +160,9 @@ def apply_rotation_only_pose(
 def decompose_target(
     sliceB: AnnData,
     n_neighbors: int = 15,
-    resolution: float = 0.3,
-    min_community_size_frac: float = 0.05,
+    resolution: float = None,
+    min_community_size_frac: float = 0.15,
+    target_min_region_frac: float = 0.20,
     use_gpu: bool = False,
     verbose: bool = True,
 ) -> np.ndarray:
@@ -171,33 +172,52 @@ def decompose_target(
     Algorithm
     ---------
     1. Build a spatial kNN graph on sliceB's 2D coordinates.
-    2. Run Leiden community detection to find autonomous spatial communities.
-    3. Merge communities smaller than min_community_size_frac * n_B into
-       their spatially nearest neighbour.
+    2. Run Leiden community detection with **adaptive resolution**:
+       - Start at a very low resolution (0.001) and increase until every
+         community is smaller than target_min_region_frac of n_B.
+       - This gives the coarsest valid partition — exactly the number of
+         top-level anatomical regions (2 for brain hemispheres, 4 for a
+         4-chamber heart, etc.) without over-segmenting.
+    3. Merge any remaining small communities (< min_community_size_frac)
+       into their spatially nearest neighbour.
 
-    The resolution parameter controls the granularity:
-      - Low resolution (0.1–0.3):  coarse regions (hemispheres, lobes)
-      - High resolution (0.5–1.0): fine regions (cortical layers, etc.)
+    Why adaptive resolution?
+    ------------------------
+    A fixed resolution=0.3 produced K=13 tiny communities on a 14k-cell
+    MERFISH brain section — each community was only ~1000 cells, far too
+    small to represent a whole hemisphere (~7000 cells).  The problem is
+    that Leiden resolution interacts with graph density in a non-linear way
+    that differs across datasets and spatial scales.
 
-    For the hemisphere-vs-full-brain problem, resolution=0.3 reliably
-    finds K=2 communities.  For a 4-chamber heart, use resolution=0.5.
+    The adaptive search finds the largest resolution at which every
+    community still covers at least target_min_region_frac of n_B.
+    For brain hemispheres (two ~50% regions): target_min_region_frac=0.20
+    gives K=2 because any finer partition creates communities < 20% of n_B.
+
+    If resolution is passed explicitly it overrides the adaptive search.
 
     Parameters
     ----------
     sliceB     : AnnData — target slice.
     n_neighbors: int, default 15 — kNN graph connectivity.
-    resolution : float, default 0.3 — Leiden resolution (lower = fewer, larger regions).
-    min_community_size_frac : float, default 0.05
-        Communities smaller than this fraction of n_B are merged into the
-        nearest spatial neighbour.  Prevents spurious tiny communities at
-        slice boundaries from fragmenting the decomposition.
-    use_gpu    : bool — not used (community detection is CPU-only; kept for API consistency).
+    resolution : float or None
+        Leiden resolution parameter.  None (default) = adaptive search.
+        Pass a float to force a specific resolution (useful for ablation).
+    min_community_size_frac : float, default 0.15
+        After adaptive search, merge communities smaller than this fraction.
+        15% prevents tiny boundary artefacts from fragmenting the partition.
+    target_min_region_frac : float, default 0.20
+        Adaptive search target: find the coarsest resolution where every
+        community covers at least this fraction of n_B.
+        0.20 → finds K=2 for brain (two 50% hemispheres).
+        0.10 → finds K≤4 (useful for heart with four 25% chambers).
+        Lower values allow finer partitions.
+    use_gpu    : bool — kept for API consistency (community detection is CPU).
     verbose    : bool.
 
     Returns
     -------
     labels : (n_B,) int32 array — community index 0..K-1 for each cell.
-        Cells in community k are a spatially cohesive anatomical region.
     """
     try:
         import igraph as ig
@@ -220,39 +240,97 @@ def decompose_target(
         print(f"[RAPA decompose] Building spatial kNN graph (k={n_neighbors}) "
               f"on {n_B} cells …")
 
-    # ── Build kNN graph ─────────────────────────────────────────────────────
+    # ── Build kNN graph (built once, reused for all resolution trials) ───────
     nn     = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm='ball_tree')
     nn.fit(coords)
     dists, indices = nn.kneighbors(coords)
-    # Skip self (column 0)
     dists   = dists[:, 1:]
     indices = indices[:, 1:]
 
-    # Convert distances to Gaussian affinity weights
-    sigma  = np.median(dists)
+    sigma   = np.median(dists)
     weights = np.exp(-dists ** 2 / (2 * sigma ** 2)).ravel()
     rows    = np.repeat(np.arange(n_B), n_neighbors)
     cols    = indices.ravel()
 
-    # Build igraph weighted undirected graph
     edges  = list(zip(rows.tolist(), cols.tolist()))
     G_ig   = ig.Graph(n=n_B, edges=edges, directed=False)
     G_ig.es['weight'] = weights.tolist()
 
-    # ── Leiden community detection ──────────────────────────────────────────
-    if verbose:
-        print(f"[RAPA decompose] Running Leiden (resolution={resolution}) …")
+    # ── Adaptive resolution search ───────────────────────────────────────────
+    if resolution is not None:
+        # User specified a resolution — use it directly
+        res_to_use = resolution
+        if verbose:
+            print(f"[RAPA decompose] Using user-specified resolution={resolution}")
+    else:
+        # Binary search for the largest resolution where every community
+        # still covers at least target_min_region_frac of n_B.
+        #
+        # Why this criterion?
+        #   If target_min_region_frac=0.20 and we have K=2 hemispheres,
+        #   each ~50% of n_B — both pass the 20% threshold.
+        #   If resolution is too high and we get K=5 communities of ~20%
+        #   each, SOME will be below 20% and the condition fails.
+        #   We increase resolution until all communities are above the
+        #   threshold, which gives us the coarsest valid partition.
+        lo, hi       = 1e-4, 0.05
+        best_res     = lo
+        best_labels  = None
 
+        if verbose:
+            print(f"[RAPA decompose] Adaptive resolution search "
+                  f"(target_min_frac={target_min_region_frac:.2f}) …")
+
+        for _ in range(20):       # at most 20 bisection steps
+            mid = (lo + hi) / 2.0
+            part = leidenalg.find_partition(
+                G_ig,
+                leidenalg.RBConfigurationVertexPartition,
+                weights='weight',
+                resolution_parameter=mid,
+                seed=42,
+            )
+            lbl   = np.array(part.membership, dtype=np.int32)
+            sizes = np.array([(lbl == k).sum() for k in np.unique(lbl)])
+            min_frac = sizes.min() / n_B
+
+            if min_frac >= target_min_region_frac:
+                # All communities large enough — try a higher resolution
+                # (finer partition) to see if we can get more detail
+                best_res    = mid
+                best_labels = lbl
+                lo          = mid
+            else:
+                # Some community too small — decrease resolution
+                hi = mid
+
+            if hi - lo < 1e-6:
+                break
+
+        if best_labels is None:
+            # No resolution found all-above-threshold; use lowest tried
+            if verbose:
+                print(f"[RAPA decompose] Adaptive search found no valid resolution; "
+                      f"falling back to spectral (K=2)")
+            return _spectral_decompose(sliceB, verbose=verbose)
+
+        res_to_use = best_res
+        if verbose:
+            K_found = len(np.unique(best_labels))
+            print(f"[RAPA decompose] Adaptive resolution={res_to_use:.6f} "
+                  f"→ K={K_found} communities")
+
+    # ── Run final Leiden at chosen resolution ────────────────────────────────
     partition = leidenalg.find_partition(
         G_ig,
         leidenalg.RBConfigurationVertexPartition,
         weights='weight',
-        resolution_parameter=resolution,
+        resolution_parameter=res_to_use,
         seed=42,
     )
     labels = np.array(partition.membership, dtype=np.int32)
 
-    # ── Merge small communities ─────────────────────────────────────────────
+    # ── Merge small communities ───────────────────────────────────────────────
     labels = _merge_small_communities(labels, coords, min_community_size_frac)
 
     K = len(np.unique(labels))
@@ -820,8 +898,9 @@ def pairwise_align_rapa(
     estimate_rotation: bool = True,
     rotation_only_pose: bool = True,
     # ── Decomposition ──────────────────────────────────────────────────────
-    leiden_resolution: float = 0.3,
-    min_community_size_frac: float = 0.05,
+    leiden_resolution: float = None,
+    target_min_region_frac: float = 0.20,
+    min_community_size_frac: float = 0.15,
     # ── Anchor ─────────────────────────────────────────────────────────────
     lambda_anchor: float = 2.0,
     boundary_sigma_frac: float = 0.05,
@@ -830,10 +909,10 @@ def pairwise_align_rapa(
     lambda_target: float = 0.1,
     contiguity_sigma: Optional[float] = None,
     # ── FUGW unbalanced solver ─────────────────────────────────────────────
-    reg_marginals: float = 0.1,
-    epsilon: float = 0.01,
+    reg_marginals: float = 1.0,
+    epsilon: float = 0.0,
     divergence: str = 'kl',
-    unbalanced_solver: str = 'sinkhorn',
+    unbalanced_solver: str = 'mm',
     max_iter_fugw: int = 100,
     # ── cVAE for cross-timepoint ────────────────────────────────────────────
     cvae_model=None,
@@ -902,11 +981,11 @@ def pairwise_align_rapa(
     lambda_spatial : float, default 0.1 — source-side contiguity weight.
     lambda_target  : float, default 0.1 — target-side contiguity weight.
 
-    reg_marginals : float, default 0.1
+    reg_marginals : float, default 1.0
         KL penalty on marginal violations in FUGW.
         Lower → more partial matching allowed.
         s_prior is used to scale this automatically.
-    epsilon : float, default 0.01 — Sinkhorn regularisation (0 = exact MM solver).
+    epsilon : float, default 0.0 — Sinkhorn regularisation (0 = exact MM solver).
 
     cvae_model / cvae_path : pre-trained cVAE for cross-timepoint expression cost.
     cvae_epochs : int — epochs for on-the-fly cVAE training.
@@ -972,6 +1051,7 @@ def pairwise_align_rapa(
     community_labels = decompose_target(
         sliceB,
         resolution=leiden_resolution,
+        target_min_region_frac=target_min_region_frac,
         min_community_size_frac=min_community_size_frac,
         verbose=gpu_verbose,
     )
