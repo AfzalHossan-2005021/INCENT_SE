@@ -285,40 +285,79 @@ def seot_em(
     t           : (2,)   float64     -- recovered translation.
     history     : list of float      -- residual per iteration.
     """
-    # Normalise spatial scale by the diameter of B
-    D_norm = float(np.linalg.norm(coords_B.max(axis=0) - coords_B.min(axis=0)))
-    if D_norm < 1e-6:
-        D_norm = 1.0
+    # ── Coordinate normalisation ──────────────────────────────────────────────
+    # CRITICAL FIX for cross-timepoint data.
+    #
+    # Problem: sliceA and sliceB come from different scanners with completely
+    # unrelated coordinate origins (x ~ 1.76M, y ~ 4.86M etc.).  The Procrustes
+    # M-step computes t = y_bar - R @ x_bar.  When y_bar and x_bar are in
+    # different scanner frames, t is dominated by the ~million-micron scanner
+    # offset and bears no relation to the tissue geometry.
+    #
+    # Fix: normalise each slice INDEPENDENTLY to zero-mean, unit-scale before
+    # running EM.  The EM then works in a shared normalised space where both
+    # slices fill the range [-1, +1].  Rotation R is scale-invariant; after EM
+    # we convert t back to the physical coordinate frame of sliceB.
+    #
+    # Conversion:  coords_A_aligned = scale_B/scale_A * R_em @ (coords_A - mu_A)
+    #                                + scale_B * t_em_n + mu_B
+    # So physical translation:  t_phys = -scale_B/scale_A * R_em @ mu_A
+    #                                    + scale_B * t_em_n + mu_B
 
-    R, t = R_init.copy(), t_init.copy()
+    mu_A    = coords_A.mean(axis=0)
+    mu_B    = coords_B.mean(axis=0)
+    scale_A = float(np.linalg.norm(coords_A - mu_A, axis=1).mean()) + 1e-6
+    scale_B = float(np.linalg.norm(coords_B - mu_B, axis=1).mean()) + 1e-6
+
+    cA_n = (coords_A - mu_A) / scale_A   # normalised sliceA coords
+    cB_n = (coords_B - mu_B) / scale_B   # normalised sliceB coords
+
+    # Transform R_init and t_init into normalised space.
+    # In physical space: x_A_phys -> R_init @ x_A_phys + t_init
+    # In norm space:     cA_n     -> R_init @ cA_n + t_init_n
+    # where t_init_n = (t_init + R_init @ mu_A - mu_B) / scale_B
+    t_init_n = ((t_init + R_init @ mu_A - mu_B) / scale_B
+                if not np.allclose(t_init, 0.0)
+                else np.zeros(2))
+
+    D_norm = 1.0   # already unit-scale
+
+    R, t = R_init.copy(), t_init_n.copy()
     history = []
     pi = np.outer(a, b)   # uniform initialisation
 
     for it in range(max_iter):
-        # ── E-step: OT with current (R, t) ────────────────────────────────
-        C_spatial = build_spatial_cost(R, t, coords_A, coords_B, D_norm)
+        # ── E-step: OT with current (R, t) in normalised space ────────────
+        C_spatial = build_spatial_cost(R, t, cA_n, cB_n, D_norm)
         cost = ((1.0 - alpha) * M_bio.astype(np.float32)
                 + alpha        * C_spatial).astype(np.float64)
 
         pi = solve_ot_step(cost, a, b, rho_A, rho_B, reg_sinkhorn)
 
-        # ── M-step: weighted Procrustes ────────────────────────────────────
-        R, t, residual = weighted_procrustes(pi, coords_A, coords_B)
+        # ── M-step: weighted Procrustes in normalised space ────────────────
+        R, t, residual = weighted_procrustes(pi, cA_n, cB_n)
 
         history.append(residual)
 
         if verbose:
-            theta = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+            theta_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
             print(f"  [SEOT EM] iter={it+1:3d}  residual={residual:.6f}  "
-                  f"theta={theta:.2f}  tx={t[0]:.1f}  ty={t[1]:.1f}  "
-                  f"pi_mass={pi.sum():.4f}")
+                  f"theta={theta_deg:.2f}  pi_mass={pi.sum():.4f}")
 
         if it > 0 and abs(history[-1] - history[-2]) / (abs(history[-2]) + 1e-12) < tol:
             if verbose:
                 print(f"  [SEOT EM] Converged at iteration {it+1}.")
             break
 
-    return pi, R, t, history
+    # ── Convert (R, t) from normalised back to physical coordinates ────────
+    # Physical alignment: coords_A_aligned = (scale_B/scale_A)*R @ (coords_A-mu_A)
+    #                                       + scale_B*t + mu_B
+    # Equivalently:  x_aligned = R @ x_A + t_phys
+    #   where t_phys = -(scale_B/scale_A)*R @ mu_A + scale_B*t + mu_B
+    scale_ratio = scale_B / scale_A
+    t_physical  = -scale_ratio * (R @ mu_A) + scale_B * t + mu_B
+
+    return pi, R, t_physical, history
 
 
 # ==========================================================================
@@ -681,16 +720,58 @@ def pairwise_align_seot(
     # ==================================================================
     # STEP 3: SE(2)-OT EM
     # ==================================================================
-    print(f"[SEOT] Step 3: SE(2)-OT EM (max_iter={max_em_iter}, "
+    print(f"[SEOT] Step 3: Multi-start SE(2)-OT EM (max_iter={max_em_iter}, "
           f"rho_A={rho_A_use:.3f}, rho_B={rho_B_use:.3f}) ...")
 
+    # Multi-start EM: try 8 candidate rotations spaced 45° apart.
+    # The BISPA rotation is one candidate; we add 7 more to ensure we
+    # find the correct hemisphere even when BISPA decomposition fails (K=1).
+    # Each run uses fewer iterations; the best solution gets full refinement.
+    from .pose import _rotation_matrix as _rm
+    theta_bispa = float(np.degrees(np.arctan2(R_init_em[1, 0], R_init_em[0, 0])))
+    candidate_thetas = [theta_bispa + k*45.0 for k in range(8)]
+
+    best_pi, best_R, best_t, best_hist = None, None, None, None
+    best_final_cost = np.inf
+
+    for theta_c in candidate_thetas:
+        R_c = _rm(theta_c)
+        pi_c, R_c_em, t_c_em, hist_c = seot_em(
+            M_bio=M_bio,
+            coords_A=coords_A,
+            coords_B=coords_B,
+            a=a_np, b=b_np,
+            R_init=R_c,
+            t_init=np.zeros(2),    # zero t; Procrustes will find it
+            alpha=alpha,
+            rho_A=rho_A_use,
+            rho_B=rho_B_use,
+            reg_sinkhorn=reg_sinkhorn,
+            max_iter=10,           # quick screening
+            tol=tol_em,
+            verbose=False,
+        )
+        # Score: final residual + biological cost
+        final_bio = float((M_bio.astype(np.float64) * pi_c).sum())
+        final_cost = hist_c[-1] + (1 - alpha) * final_bio
+        if verbose:
+            print(f"  [SEOT multi-start] theta={theta_c:.1f}  "
+                  f"residual={hist_c[-1]:.4f}  bio={final_bio:.4f}  "
+                  f"total={final_cost:.4f}")
+        if final_cost < best_final_cost:
+            best_final_cost = final_cost
+            best_pi, best_R, best_t, best_hist = pi_c, R_c_em, t_c_em, hist_c
+
+    # Full refinement from the best starting rotation
+    best_theta = float(np.degrees(np.arctan2(best_R[1, 0], best_R[0, 0])))
+    print(f"[SEOT] Best start: theta={best_theta:.1f}  refining ...")
     pi, R_em, t_em, history = seot_em(
         M_bio=M_bio,
         coords_A=coords_A,
         coords_B=coords_B,
         a=a_np, b=b_np,
-        R_init=R_init_em,
-        t_init=t_init_em,
+        R_init=best_R,
+        t_init=np.zeros(2),
         alpha=alpha,
         rho_A=rho_A_use,
         rho_B=rho_B_use,

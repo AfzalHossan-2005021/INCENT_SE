@@ -134,12 +134,115 @@ def decompose_slice(
     labels = np.array(part.membership, dtype=np.int32)
     labels = _merge_small(labels, coords, min_community_size_frac)
 
+    # ── K=1 fallback: expression-guided spectral clustering ──────────────────
+    # When Leiden finds K=1 (the spatial kNN graph is too well-connected to
+    # split, e.g. brain hemispheres joined through corpus callosum), fall back
+    # to spectral clustering on a COMBINED spatial+expression affinity.
+    #
+    # Why combined affinity works when pure-spatial Leiden fails:
+    #   - The corpus callosum has a distinct cell-type composition (oligodendrocytes)
+    #   - Cells in the left hemisphere are more similar to other left cells
+    #     than to right cells in expression space
+    #   - The combined affinity has a lower similarity across the midline,
+    #     so spectral clustering correctly separates the two halves
+    if len(np.unique(labels)) == 1:
+        if verbose:
+            print(f"[BISPA decompose:{slice_label}] K=1 from Leiden; "
+                  f"trying expression-guided spectral clustering ...")
+        labels = _expression_guided_spectral(adata, n_clusters=2, verbose=verbose)
+        if verbose:
+            K2 = len(np.unique(labels))
+            for k in np.unique(labels):
+                sz2 = (labels == k).sum()
+                print(f"  [{slice_label}] C_{k}: {sz2} cells ({sz2/n*100:.1f}%)")
+            print(f"[BISPA decompose:{slice_label}] Spectral K={K2} communities.")
+
     if verbose:
         K = len(np.unique(labels))
         for k in np.unique(labels):
             sz = (labels == k).sum()
             print(f"  [{slice_label}] C_{k}: {sz} cells ({sz/n*100:.1f}%)")
         print(f"[BISPA decompose:{slice_label}] K={K} communities.")
+
+    return labels
+
+
+def _expression_guided_spectral(adata, n_clusters=2, n_neighbors=15,
+                                verbose=True):
+    """
+    Expression-guided spectral clustering for organs with spatially adjacent
+    symmetric regions (e.g. brain hemispheres connected through corpus callosum).
+
+    Pure spatial clustering fails because the corpus callosum spatially bridges
+    both hemispheres.  This function builds a combined affinity matrix:
+      W[i,j] = spatial_affinity[i,j] * expression_affinity[i,j]
+
+    Cells in the same hemisphere have high spatial AND expression similarity.
+    Cells across the midline have lower expression similarity (different cell
+    type compositions) even when spatially adjacent.
+
+    Parameters
+    ----------
+    adata      : AnnData with .obsm['spatial'] and .obs['cell_type_annot'].
+    n_clusters : int -- number of clusters (2 for brain hemispheres).
+    n_neighbors: int -- for kNN affinity construction.
+    verbose    : bool.
+
+    Returns
+    -------
+    labels : (n_cells,) int32.
+    """
+    import scipy.sparse as sp
+    from sklearn.cluster import SpectralClustering
+    from sklearn.neighbors import NearestNeighbors
+
+    coords = adata.obsm["spatial"].astype(np.float64)
+    n = len(coords)
+
+    # ── Spatial affinity ──────────────────────────────────────────────────
+    nn = NearestNeighbors(n_neighbors=n_neighbors + 1, algorithm="ball_tree")
+    nn.fit(coords)
+    dists, indices = nn.kneighbors(coords)
+    dists, indices = dists[:, 1:], indices[:, 1:]
+    sigma_sp = np.median(dists) + 1e-6
+    W_sp = np.exp(-dists ** 2 / (2 * sigma_sp ** 2))   # (n, k)
+
+    # ── Expression affinity (cell-type based) ─────────────────────────────
+    ct = np.asarray(adata.obs["cell_type_annot"].astype(str))
+    uct = np.unique(ct)
+    ct_idx = np.array([np.where(uct == c)[0][0] for c in ct])
+
+    # Expression affinity = fraction of neighbours with same cell type
+    W_expr = np.zeros_like(W_sp)
+    for i in range(n):
+        nbrs = indices[i]
+        same = (ct_idx[nbrs] == ct_idx[i]).astype(np.float32)
+        W_expr[i] = same + 0.1   # +0.1 so different types still have some weight
+
+    # ── Combined affinity ─────────────────────────────────────────────────
+    W_comb = W_sp * W_expr   # element-wise product: high only when BOTH similar
+
+    # Build sparse affinity matrix
+    rows = np.repeat(np.arange(n), n_neighbors)
+    cols = indices.ravel()
+    vals = W_comb.ravel()
+
+    A = sp.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
+    A = (A + A.T).toarray() * 0.5   # symmetrise
+
+    # ── Spectral clustering on combined affinity ───────────────────────────
+    sc = SpectralClustering(
+        n_clusters=n_clusters,
+        affinity="precomputed",
+        random_state=42,
+        n_init=10,
+    )
+    labels = sc.fit_predict(A).astype(np.int32)
+
+    if verbose:
+        for k in np.unique(labels):
+            sz = (labels == k).sum()
+            print(f"  [spectral] C_{k}: {sz} cells ({sz/n*100:.1f}%)")
 
     return labels
 
@@ -531,10 +634,10 @@ def pairwise_align_bispa(
     lambda_target=0.1,
     contiguity_sigma=None,
     # FUGW
-    base_reg_marginals=0.1,
-    epsilon=0.01,
+    base_reg_marginals=1.0,
+    epsilon=0.0,
     divergence="kl",
-    unbalanced_solver="sinkhorn",
+    unbalanced_solver="mm",
     max_iter_fugw=100,
     # Pose
     rough_grid_size=256,
@@ -598,7 +701,7 @@ def pairwise_align_bispa(
     lambda_spatial : float, default 0.1 -- source-side contiguity weight.
     lambda_target  : float, default 0.1 -- target-side contiguity weight.
 
-    base_reg_marginals : float, default 0.1
+    base_reg_marginals : float, default 1.0
         Base KL marginal relaxation. Scaled per-side by overlap fractions:
           rho_A = base_reg * s_A  (where s_A = matched A cells / n_A)
           rho_B = base_reg * s_B  (where s_B = matched B cells / n_B)
