@@ -81,6 +81,17 @@ from .rapa import (
     apply_region_translation,
     target_contiguity_gradient,
 )
+# ── INCENT-SE: BISPA (Bidirectional Symmetric Partial Alignment) ─────────────
+from .bispa import (
+    pairwise_align_bispa,
+    decompose_slice,
+    build_community_similarity,
+    hungarian_matching,
+    recover_pose_matched,
+    build_bidirectional_anchor,
+    compute_overlap_fractions,
+)
+
 
 # ── INCENT-SE: LDDMM deformation ─────────────────────────────────────────────
 from .lddmm import (
@@ -100,7 +111,6 @@ __all__ = [
     'fused_gromov_wasserstein_incent', 'jensenshannon_divergence_backend',
     'pairwise_msd', 'to_dense_array', 'extract_data_matrix',
     '_preprocess', '_to_np',
-
     # INCENT-SE alignment
     'pairwise_align_se', 'pairwise_align_spatiotemporal',
     # Pose
@@ -112,6 +122,10 @@ __all__ = [
     'contiguity_regulariser', 'contiguity_gradient', 'estimate_overlap_fraction',
     # cVAE
     'INCENT_cVAE', 'train_cvae', 'latent_cost',
+    # BISPA (supersedes RAPA for the general case)
+    'pairwise_align_bispa', 'decompose_slice', 'build_community_similarity',
+    'hungarian_matching', 'recover_pose_matched', 'build_bidirectional_anchor',
+    'compute_overlap_fractions',
     # RAPA
     'pairwise_align_rapa', 'decompose_target', 'match_source_to_region',
     'build_anchor_cost', 'apply_rotation_only_pose', 'apply_region_translation',

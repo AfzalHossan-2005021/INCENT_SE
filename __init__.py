@@ -64,6 +64,15 @@ from .incent import (
     apply_region_translation,
     target_contiguity_gradient,
 
+# ── INCENT-SE: BISPA (Bidirectional Iterative Spatial Pose Alignment) ───────────────────────────────────────────────
+    pairwise_align_bispa,
+    decompose_slice,
+    build_community_similarity,
+    hungarian_matching,
+    recover_pose_matched,
+    build_bidirectional_anchor,
+    compute_overlap_fractions,
+
 # ── INCENT-SE: LDDMM deformation ─────────────────────────────────────────────
     LDDMMDeformation,
     estimate_deformation,
@@ -114,6 +123,14 @@ __all__ = [
     'apply_rotation_only_pose',
     'apply_region_translation',
     'target_contiguity_gradient',
+    # BISPA
+    'pairwise_align_bispa',
+    'decompose_slice',
+    'build_community_similarity',
+    'hungarian_matching',
+    'recover_pose_matched',
+    'build_bidirectional_anchor',
+    'compute_overlap_fractions',
     # LDDMM
     'LDDMMDeformation',
     'estimate_deformation',

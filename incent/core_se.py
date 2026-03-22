@@ -399,10 +399,11 @@ def pairwise_align_spatiotemporal(
     radius:    float,
     filePath:  str,
     # ── RAPA: region-aware partial alignment (strongly recommended for cross-timepoint) ──
-    use_rapa:          bool             = True,
-    leiden_resolution: float           = 0.3,
-    lambda_anchor:     float           = 2.0,
-    lambda_target:     float           = 0.1,
+    use_rapa:               bool             = True,
+    leiden_resolution:      float            = None,
+    target_min_region_frac: float            = 0.20,
+    lambda_anchor:          float            = 2.0,
+    lambda_target:          float            = 0.1,
     # ── cVAE for expression embedding ─────────────────────────────────────────
     cvae_model: Optional[INCENT_cVAE]  = None,
     cvae_path:  Optional[str]          = None,
@@ -550,25 +551,23 @@ def pairwise_align_spatiotemporal(
     #   (2) Balanced OT on a partial-overlap pair (use unbalanced FUGW)
     #   (3) No mechanism to choose the correct organ sub-region (use region matching)
     if use_rapa:
-        from .rapa import pairwise_align_rapa
-        theta_deg = None
-        if estimate_rotation:
-            from .pose import estimate_pose as _est_pose
-            theta_deg, _, _, _ = _est_pose(sliceA, sliceB, grid_size=256,
-                                           verbose=gpu_verbose)
-        result = pairwise_align_rapa(
+        # BISPA supersedes RAPA: treats both slices symmetrically so either
+        # slice can be the larger one with multiple regions.
+        from .bispa import pairwise_align_bispa
+        result = pairwise_align_bispa(
             sliceA=sliceA, sliceB=sliceB,
             alpha=alpha, beta=beta, gamma=gamma,
             radius=radius, filePath=filePath,
-            theta_deg=theta_deg,
-            estimate_rotation=False,       # already done above
-            rotation_only_pose=True,       # discard scanner-frame translation
-            leiden_resolution=leiden_resolution,
+            target_min_region_frac_A=target_min_region_frac,
+            target_min_region_frac_B=target_min_region_frac,
+            leiden_resolution_A=leiden_resolution,
+            leiden_resolution_B=leiden_resolution,
             lambda_anchor=lambda_anchor,
             lambda_spatial=lambda_spatial,
             lambda_target=lambda_target,
             cvae_model=cvae_model, cvae_path=cvae_path,
             cvae_epochs=cvae_epochs, cvae_latent_dim=cvae_latent_dim,
+            cross_timepoint=True,
             use_rep=use_rep,
             numItermax=numItermax,
             use_gpu=use_gpu, gpu_verbose=gpu_verbose, verbose=verbose,
@@ -579,10 +578,10 @@ def pairwise_align_spatiotemporal(
         )
         if return_obj:
             pi, diag = result
-            return pi, diag['matched_region'], diag['overlap_fraction'], \
-                   diag['region_scores'], diag
+            # 4-tuple matching the original BCD signature (pi, phi, xi, cost_history)
+            return pi, diag['sliceA_aligned'], diag, []
         return result
-    # ── End RAPA dispatch (use_rapa=False falls through to original BCD) ───────
+    # -- End BISPA dispatch (use_rapa=False falls through to original BCD) -----
 
     log_name = (f"{filePath}/log_st_{sliceA_name}_{sliceB_name}.txt"
                 if sliceA_name and sliceB_name else f"{filePath}/log_st.txt")
