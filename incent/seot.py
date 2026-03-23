@@ -249,7 +249,7 @@ def seot_em(
     max_iter: int = 50,
     tol: float = 1e-5,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[float]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[float], float]:
     """
     SE(2)-OT EM algorithm: jointly optimise (R, t) and correspondence pi.
 
@@ -284,6 +284,7 @@ def seot_em(
     R           : (2, 2) float64     -- recovered rotation.
     t           : (2,)   float64     -- recovered translation.
     history     : list of float      -- residual per iteration.
+    obj         : float              -- final objective value.
     """
     # ── Coordinate normalisation ──────────────────────────────────────────────
     # CRITICAL FIX for cross-timepoint data.
@@ -385,7 +386,7 @@ def seot_em(
     scale_ratio = scale_B / scale_A
     t_physical  = -scale_ratio * (R @ mu_A) + scale_B * t + mu_B
 
-    return pi, R, t_physical, history
+    return pi, R, t_physical, history, scale_ratio
 
 
 # ==========================================================================
@@ -847,7 +848,10 @@ def pairwise_align_seot(
 
     # Multi-start EM: try 8 candidate rotations spaced 45 degrees apart.
     from .pose import _rotation_matrix as _rm
-    theta_bispa = float(np.degrees(np.arctan2(R_init_em[1, 0], R_init_em[0, 0])))
+    # Use the BISPA Fourier estimate as the multi-start base.
+    # R_init_em = I (0°) was wrong: the BISPA estimate (e.g. 307°) is the
+    # best starting point and should always appear in the candidate set.
+    theta_bispa = bispa_info["theta_init"]
     candidate_thetas = [theta_bispa + k*45.0 for k in range(8)]
 
     best_pi, best_R, best_t, best_hist = None, None, None, None
@@ -855,7 +859,7 @@ def pairwise_align_seot(
 
     for theta_c in candidate_thetas:
         R_c = _rm(theta_c)
-        pi_c, R_c_em, t_c_em, hist_c = seot_em(
+        pi_c, R_c_em, t_c_em, hist_c, _sr_c = seot_em(
             M_bio=M_bio_sub,          # subsampled for speed
             coords_A=coords_A_sub,
             coords_B=coords_B,
@@ -903,7 +907,7 @@ def pairwise_align_seot(
     # Full refinement from the best starting rotation
     best_theta = float(np.degrees(np.arctan2(best_R[1, 0], best_R[0, 0])))
     print(f"[SEOT] Best start: theta={best_theta:.1f}  refining ...")
-    pi, R_em, t_em, history = seot_em(
+    pi, R_em, t_em, history, scale_ratio_em = seot_em(
         M_bio=M_bio,
         coords_A=coords_A,
         coords_B=coords_B,
@@ -920,9 +924,52 @@ def pairwise_align_seot(
     )
 
     # Total transformation: rough rotation + EM refinement
-    R_total = R_em @ R_rough   # (2,2) total rotation
-    t_total = t_em             # translation was computed in rough-rotated frame
+    R_total     = R_em @ R_rough
     theta_total = float(np.degrees(np.arctan2(R_total[1, 0], R_total[0, 0])))
+
+    # ── 1-NN post-refinement: sharpen the rotation using hard assignments ─────
+    # After the EM converges, the soft plan pi contains the best
+    # rotation estimate. Build a hard (1-NN) assignment: for each A cell,
+    # its nearest B neighbour under the current transformation. Then run
+    # one more weighted Procrustes on these hard pairs. This sharpens
+    # R and t beyond what the entropic Sinkhorn can achieve.
+    from sklearn.neighbors import NearestNeighbors
+    coords_A_n_final = (coords_A - np.median(coords_A, axis=0)) / (
+        float(np.median(np.linalg.norm(coords_A - np.median(coords_A, axis=0), axis=1))) + 1e-6)
+    coords_B_n_final = (coords_B - np.median(coords_B, axis=0)) / (
+        float(np.median(np.linalg.norm(coords_B - np.median(coords_B, axis=0), axis=1))) + 1e-6)
+    # Transform A with current R_em in normalised space
+    R_em_n   = R_em   # R_em already in normalised space (Procrustes is scale-invariant)
+    t_em_n   = (coords_B_n_final.mean(axis=0)
+                - R_em_n @ coords_A_n_final.mean(axis=0))  # rough normalised t
+    cA_t_n   = (R_em_n @ coords_A_n_final.T).T + t_em_n
+    nn_model = NearestNeighbors(n_neighbors=1, algorithm='ball_tree').fit(coords_B_n_final)
+    dists_nn, nn_idx = nn_model.kneighbors(cA_t_n)
+    nn_idx    = nn_idx.ravel()
+    # Only use inlier pairs (distance < 2x median) to avoid outlier contamination
+    threshold_nn = 2.0 * float(np.median(dists_nn))
+    inlier_mask  = dists_nn.ravel() < threshold_nn
+    if inlier_mask.sum() >= 10:
+        pi_hard = np.zeros((n_A, n_B), dtype=np.float64)
+        pi_hard[np.where(inlier_mask)[0], nn_idx[inlier_mask]] = 1.0 / inlier_mask.sum()
+        R_refined, t_refined_n, _ = weighted_procrustes(pi_hard, coords_A_n_final, coords_B_n_final)
+        if abs(np.degrees(np.arctan2(R_refined[1,0], R_refined[0,0])) -
+               np.degrees(np.arctan2(R_em[1,0], R_em[0,0]))) < 10.0:
+            R_em  = R_refined
+            print(f"[SEOT] 1-NN refinement: theta {np.degrees(np.arctan2(R_em[1,0],R_em[0,0])):.2f}°  "
+                  f"inliers={inlier_mask.sum()}/{n_A} ({inlier_mask.mean()*100:.1f}%)")
+
+    R_total     = R_em @ R_rough
+    theta_total = float(np.degrees(np.arctan2(R_total[1, 0], R_total[0, 0])))
+
+    # ── Correct sliceA_aligned with scale_ratio ───────────────────────────────
+    # The seot_em internal transformation is:
+    #   x_B = scale_ratio * R_em @ x_A_rough + t_em
+    # NOT: R_em @ x_A_rough + t_em (what the old code applied to original coords).
+    # Apply scale_ratio and use sliceA_rough coordinates directly.
+    # This avoids the rotation-composition ambiguity and the scale error.
+    coords_rough_all = sliceA_rough.obsm["spatial"].astype(np.float64)
+    t_total = t_em  # t_em is the physical translation in rough-rotated space
 
     # ==================================================================
     # STEP 4: Bilateral contiguity post-refinement
@@ -959,10 +1006,15 @@ def pairwise_align_seot(
           f"t=({t_total[0]:.1f},{t_total[1]:.1f})  "
           f"pi_mass={pi_mass:.4f}  Runtime={runtime:.1f}s")
 
-    # Build aligned sliceA for downstream use
-    sliceA_aligned = sliceA.copy()
+    # Build aligned sliceA: apply scale_ratio * R_em to sliceA_rough coordinates.
+    # This is the CORRECT transformation from seot_em:
+    #   x_B = scale_ratio_em * R_em @ x_A_rough + t_em
+    # where x_A_rough = sliceA_rough.obsm["spatial"].
+    # Using sliceA_rough avoids rotation-composition issues from R_total = R_em @ R_rough.
+    sliceA_aligned = sliceA_rough.copy()
     sliceA_aligned.obsm["spatial"] = (
-        (R_total @ sliceA.obsm["spatial"].astype(np.float64).T).T + t_total)
+        scale_ratio_em * (R_em @ sliceA_rough.obsm["spatial"].astype(np.float64).T).T
+        + t_em)
 
     if return_diagnostics:
         return pi, {
