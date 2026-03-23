@@ -304,10 +304,12 @@ def seot_em(
     # So physical translation:  t_phys = -scale_B/scale_A * R_em @ mu_A
     #                                    + scale_B * t_em_n + mu_B
 
-    mu_A    = coords_A.mean(axis=0)
-    mu_B    = coords_B.mean(axis=0)
-    scale_A = float(np.linalg.norm(coords_A - mu_A, axis=1).mean()) + 1e-6
-    scale_B = float(np.linalg.norm(coords_B - mu_B, axis=1).mean()) + 1e-6
+    # Robust normalisation: median centroid + median-absolute-deviation scale.
+    # Mean/std are sensitive to outlier cells at tissue borders (partial overlap).
+    mu_A    = np.median(coords_A, axis=0)
+    mu_B    = np.median(coords_B, axis=0)
+    scale_A = float(np.median(np.linalg.norm(coords_A - mu_A, axis=1))) + 1e-6
+    scale_B = float(np.median(np.linalg.norm(coords_B - mu_B, axis=1))) + 1e-6
 
     cA_n = (coords_A - mu_A) / scale_A   # normalised sliceA coords
     cB_n = (coords_B - mu_B) / scale_B   # normalised sliceB coords
@@ -326,23 +328,49 @@ def seot_em(
     history = []
     pi = np.outer(a, b)   # uniform initialisation
 
+    # Alpha warm-up: high spatial weight early to lock in geometry,
+    # then relax to the target alpha. This ensures the rotation/translation
+    # are determined by spatial structure first, then refined by biology.
+    # Schedule: alpha_eff = min(1.0, alpha + (1.0-alpha) * exp(-it/5))
+    # At it=0: alpha_eff ≈ 1.0 (pure spatial)
+    # At it=5: alpha_eff ≈ alpha + 0.37*(1-alpha)
+    # At it=20: alpha_eff ≈ alpha (converged to target)
+    warmup_strength = 1.0 - alpha   # how much to warm up (0 if alpha=1 already)
+
     for it in range(max_iter):
+        # Warm-up schedule: exponential decay toward target alpha
+        alpha_eff = float(alpha + warmup_strength * np.exp(-it / 5.0))
+        alpha_eff = max(alpha_eff, alpha)   # never go below target
+
         # ── E-step: OT with current (R, t) in normalised space ────────────
+        # Sinkhorn reg annealing: large reg early (fast to right basin),
+        # small reg late (sharp correspondences). 10x -> 1x over ~12 iters.
+        reg_eff = float(reg_sinkhorn * max(1.0, 10.0 * np.exp(-it / 4.0)))
         C_spatial = build_spatial_cost(R, t, cA_n, cB_n, D_norm)
-        cost = ((1.0 - alpha) * M_bio.astype(np.float32)
-                + alpha        * C_spatial).astype(np.float64)
+        cost = ((1.0 - alpha_eff) * M_bio.astype(np.float32)
+                + alpha_eff        * C_spatial).astype(np.float64)
 
-        pi = solve_ot_step(cost, a, b, rho_A, rho_B, reg_sinkhorn)
+        pi = solve_ot_step(cost, a, b, rho_A, rho_B, reg_eff)
 
-        # ── M-step: weighted Procrustes in normalised space ────────────────
-        R, t, residual = weighted_procrustes(pi, cA_n, cB_n)
+        # ── M-step: Procrustes on high-confidence pairs only ─────────────
+        # Threshold: keep entries >= 0.3 * row-max to discard noisy low-mass pairs.
+        conf_thresh = 0.3
+        row_max = pi.max(axis=1, keepdims=True)
+        row_max = np.where(row_max < 1e-12, 1e-12, row_max)
+        pi_conf = np.where(pi >= conf_thresh * row_max, pi, 0.0)
+        Z_conf  = pi_conf.sum()
+        if Z_conf > 1e-12:
+            R, t, residual = weighted_procrustes(pi_conf, cA_n, cB_n)
+        else:
+            R, t, residual = weighted_procrustes(pi, cA_n, cB_n)
 
         history.append(residual)
 
-        if verbose:
+        if verbose and (it % 5 == 0 or it < 3):
             theta_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
-            print(f"  [SEOT EM] iter={it+1:3d}  residual={residual:.6f}  "
-                  f"theta={theta_deg:.2f}  pi_mass={pi.sum():.4f}")
+            print(f"  [SEOT EM] iter={it+1:3d}  alpha_eff={alpha_eff:.3f}  "
+                  f"residual={residual:.6f}  theta={theta_deg:.2f}  "
+                  f"pi_mass={pi.sum():.4f}")
 
         if it > 0 and abs(history[-1] - history[-2]) / (abs(history[-2]) + 1e-12) < tol:
             if verbose:
@@ -455,7 +483,7 @@ def pairwise_align_seot(
     # Marginal relaxation (rho = None -> computed from BISPA match fractions)
     rho_A: Optional[float] = None,
     rho_B: Optional[float] = None,
-    base_rho: float = 0.5,
+    base_rho: float = 0.05,
     # BISPA initialisation
     target_min_region_frac: float = 0.20,
     matching_threshold: float = 0.85,
@@ -611,14 +639,39 @@ def pairwise_align_seot(
     labels_A       = bispa_info["labels_A"]
     labels_B       = bispa_info["labels_B"]
 
-    # Set marginal relaxation from matched fractions (or user override)
-    rho_A_use = rho_A if rho_A is not None else float(base_rho * max(s_A, 0.1))
-    rho_B_use = rho_B if rho_B is not None else float(base_rho * max(s_B, 0.1))
+    # ── Set marginal relaxation ───────────────────────────────────────────────
+    # The correct rho depends on HOW MUCH of each slice is unmatched.
+    #
+    # rho_A: fraction of sliceA cells that have a counterpart in sliceB.
+    #   If sliceA is a single region and sliceB contains it: s_A ≈ 1.0 → rho_A high
+    #   If sliceA has extra cells beyond sliceB: s_A < 1.0 → rho_A lower
+    #
+    # rho_B: fraction of sliceB cells that receive mass from sliceA.
+    #   KEY FIX: use the SIZE RATIO n_A / n_B, not just the matched fraction.
+    #   If sliceB has two hemispheres and sliceA is one: ~50% of B is unmatched
+    #   → rho_B = base_rho * (n_A / n_B_total) captures this correctly.
+    n_A_total = len(sliceA)
+    n_B_total = len(sliceB)
+    size_ratio = float(n_A_total) / float(n_B_total)   # e.g. 10609/14195 = 0.747
+
+    # n_A / n_B tells us: for every B cell, only this fraction "expect" a match.
+    # Smaller size_ratio → stronger target marginal relaxation needed.
+    rho_B_auto = float(base_rho * min(size_ratio, 1.0))
+    # Source: all of A tries to find a home (unless A is larger than B's matched region)
+    n_B_matched = sum((labels_B == l).sum() for _, l in matched_pairs) if matched_pairs else n_B_total
+    rho_A_auto = float(base_rho * min(float(n_B_matched) / max(n_A_total, 1), 1.0))
+
+    rho_A_use = rho_A if rho_A is not None else rho_A_auto
+    rho_B_use = rho_B if rho_B is not None else rho_B_auto
 
     log.write(f"BISPA init: theta={bispa_info['theta_init']:.1f}  "
               f"pose_score={pose_score:.3f}  s_A={s_A:.3f}  s_B={s_B:.3f}\n")
     log.write(f"matched_pairs={matched_pairs}\n")
-    log.write(f"rho_A={rho_A_use:.4f}  rho_B={rho_B_use:.4f}\n\n")
+    log.write(f"size_ratio={size_ratio:.3f}  n_A={n_A_total}  n_B={n_B_total}\n")
+    log.write(f"rho_A={rho_A_use:.4f}  rho_B={rho_B_use:.4f}  "
+              f"(auto: rho_A={rho_A_auto:.4f}  rho_B={rho_B_auto:.4f})\n\n")
+    print(f"[SEOT] rho_A={rho_A_use:.4f}  rho_B={rho_B_use:.4f}  "
+          f"(size_ratio={size_ratio:.3f})")
 
     # ==================================================================
     # STEP 2: Build biological cost M_bio (expression + cell-type + topology)
@@ -707,6 +760,52 @@ def pairwise_align_seot(
     coords_A = sA_filt.obsm["spatial"].astype(np.float64)
     coords_B = sB_filt.obsm["spatial"].astype(np.float64)
 
+    # ── Spatial proximity bias for target marginal b_weighted ────────────────
+    # Core insight: after the rough SE(2) rotation, sliceA's centroid is
+    # placed near sliceB's global centroid (midline). B cells that are
+    # SPATIALLY CLOSE to sliceA's actual footprint are much more likely to
+    # be correct matches than B cells far away (wrong hemisphere, extra chamber).
+    #
+    # We build b_weighted[j] = Gaussian(distance(y_j, footprint_A)) * b[j].
+    # sigma = sliceA's median radius (how spread out A is). B cells at distance
+    # > 2*sigma from A's centroid get weight exp(-2) ≈ 0.14x, at 3*sigma get 0.01x.
+    #
+    # This is GENERAL: works for brain (2 hemispheres), heart (4 chambers),
+    # liver (5 lobes), any organ, any K. No community detection needed.
+    # The rho_B marginal relaxation then allows the plan to shed the
+    # down-weighted B cells entirely.
+    coords_A_rough_full = sliceA_rough.obsm["spatial"].astype(np.float64)
+    coords_B_full       = sliceB.obsm["spatial"].astype(np.float64)
+    centroid_A_rough    = np.median(coords_A_rough_full, axis=0)
+    # sigma = median distance from sliceA centroid to A cells (robust A radius)
+    sigma_bias          = float(np.median(
+        np.linalg.norm(coords_A_rough_full - centroid_A_rough, axis=1))) + 1e-6
+    # Distance from each B cell to sliceA's centroid
+    d_B_to_A = np.linalg.norm(coords_B_full - centroid_A_rough, axis=1)
+    # Gaussian weight: high near A, low far from A
+    # Use half the A-radius as sigma so that B cells at distance > 1.5 * sigma
+    # (wrong hemisphere / extra organ region) get weight < exp(-1.125) ≈ 0.32.
+    # Apply a floor eps=0.01 so wrong-region cells are 100x less attractive as
+    # targets: the OT plan naturally concentrates on the correct region.
+    sigma_tight = sigma_bias * 0.5   # tighter sigma for stronger contrast
+    w_spatial   = np.maximum(
+        np.exp(-0.5 * (d_B_to_A / sigma_tight) ** 2),
+        0.01                          # floor: never fully exclude (OT stays feasible)
+    ).astype(np.float64)
+    # Apply to b_np for the FILTERED slice (sB_filt may be a subset of sliceB)
+    bc_B_full = np.array(sliceB.obs_names)
+    bc_B_filt = np.array(sB_filt.obs_names)
+    bc_to_w   = {bc: w_spatial[i] for i, bc in enumerate(bc_B_full)}
+    w_filt    = np.array([bc_to_w.get(bc, 0.01) for bc in bc_B_filt], dtype=np.float64)
+    b_weighted = b_np * w_filt
+    b_weighted = np.maximum(b_weighted, 1e-10)   # avoid exact zeros
+    b_weighted /= b_weighted.sum()
+    frac_near = float((d_B_to_A < 1.5 * sigma_bias).mean())
+    print(f"[SEOT] Spatial bias: sigma={sigma_bias:.1f}  "
+          f"{frac_near*100:.1f}% of B cells within 1.5*sigma of A centroid")
+    log.write(f"Spatial bias: sigma={sigma_bias:.1f}  "
+              f"frac_near={frac_near:.3f}\n")
+
     # Adjust R_init and t_init to account for the rough rotation already applied
     # (sliceA_rough has theta_init baked in; R_init from Procrustes is the
     #  ADDITIONAL rotation needed. Total rotation = R_procrustes @ R_rough)
@@ -723,10 +822,30 @@ def pairwise_align_seot(
     print(f"[SEOT] Step 3: Multi-start SE(2)-OT EM (max_iter={max_em_iter}, "
           f"rho_A={rho_A_use:.3f}, rho_B={rho_B_use:.3f}) ...")
 
-    # Multi-start EM: try 8 candidate rotations spaced 45° apart.
-    # The BISPA rotation is one candidate; we add 7 more to ensure we
-    # find the correct hemisphere even when BISPA decomposition fails (K=1).
-    # Each run uses fewer iterations; the best solution gets full refinement.
+    # ── Coarse-to-fine: spatially stratified subsample for screening ──────
+    N_sub = min(3000, n_A)
+    if N_sub < n_A:
+        cA_raw = coords_A
+        cA_min, cA_max = cA_raw.min(axis=0), cA_raw.max(axis=0)
+        n_grid = int(np.ceil(np.sqrt(N_sub)))
+        gx = np.floor((cA_raw[:,0]-cA_min[0]) / (cA_max[0]-cA_min[0]+1e-6) * n_grid).astype(int)
+        gy = np.floor((cA_raw[:,1]-cA_min[1]) / (cA_max[1]-cA_min[1]+1e-6) * n_grid).astype(int)
+        grid_ids = gx * (n_grid+1) + gy
+        rng_sub  = np.random.default_rng(42)
+        sub_idx  = []
+        for gid in np.unique(grid_ids):
+            pool = np.where(grid_ids == gid)[0]
+            k    = max(1, int(np.ceil(N_sub * len(pool) / n_A)))
+            sub_idx.extend(rng_sub.choice(pool, size=min(k, len(pool)), replace=False))
+        sub_idx  = np.array(sub_idx[:N_sub])
+        coords_A_sub = coords_A[sub_idx]
+        M_bio_sub    = M_bio[sub_idx, :]
+        a_sub        = a_np[sub_idx].copy(); a_sub /= a_sub.sum()
+        print(f'[SEOT] Coarse subsampling: {len(sub_idx)}/{n_A} A cells for screening')
+    else:
+        coords_A_sub, M_bio_sub, a_sub = coords_A, M_bio, a_np
+
+    # Multi-start EM: try 8 candidate rotations spaced 45 degrees apart.
     from .pose import _rotation_matrix as _rm
     theta_bispa = float(np.degrees(np.arctan2(R_init_em[1, 0], R_init_em[0, 0])))
     candidate_thetas = [theta_bispa + k*45.0 for k in range(8)]
@@ -737,10 +856,10 @@ def pairwise_align_seot(
     for theta_c in candidate_thetas:
         R_c = _rm(theta_c)
         pi_c, R_c_em, t_c_em, hist_c = seot_em(
-            M_bio=M_bio,
-            coords_A=coords_A,
+            M_bio=M_bio_sub,          # subsampled for speed
+            coords_A=coords_A_sub,
             coords_B=coords_B,
-            a=a_np, b=b_np,
+            a=a_sub, b=b_weighted,
             R_init=R_c,
             t_init=np.zeros(2),    # zero t; Procrustes will find it
             alpha=alpha,
@@ -751,8 +870,8 @@ def pairwise_align_seot(
             tol=tol_em,
             verbose=False,
         )
-        # Score: final residual + biological cost
-        final_bio = float((M_bio.astype(np.float64) * pi_c).sum())
+        # Score: final residual + biological cost (subsampled)
+        final_bio = float((M_bio_sub.astype(np.float64) * pi_c).sum())
         final_cost = hist_c[-1] + (1 - alpha) * final_bio
         if verbose:
             print(f"  [SEOT multi-start] theta={theta_c:.1f}  "
@@ -762,6 +881,25 @@ def pairwise_align_seot(
             best_final_cost = final_cost
             best_pi, best_R, best_t, best_hist = pi_c, R_c_em, t_c_em, hist_c
 
+    # Adaptive rho: after screening, the pi_mass tells us whether rho_B
+    # was too loose (pi_mass > size_ratio → too much mass transported).
+    # Fix: rho_B_final = rho_B_use * size_ratio / pi_mass_screen
+    # When pi_mass_screen=1.0, size_ratio=0.747: rho_B tightens by 25%.
+    # When pi_mass_screen≈size_ratio: no change (already correct).
+    # Clamp to [0.01, rho_B_use] for numerical safety.
+    pi_mass_screen = float(best_pi.sum())
+    if pi_mass_screen > 1e-3:
+        rho_B_final = float(np.clip(
+            rho_B_use * size_ratio / pi_mass_screen,
+            0.01, rho_B_use))
+    else:
+        rho_B_final = rho_B_use
+    rho_A_final = rho_A_use
+    print(f'[SEOT] Adaptive rho: pi_mass_screen={pi_mass_screen:.3f}  '
+          f'size_ratio={size_ratio:.3f}  rho_B {rho_B_use:.4f} -> {rho_B_final:.4f}')
+    log.write(f'Adaptive rho: pi_mass_screen={pi_mass_screen:.3f}  '
+              f'rho_B {rho_B_use:.4f} -> {rho_B_final:.4f}\n')
+
     # Full refinement from the best starting rotation
     best_theta = float(np.degrees(np.arctan2(best_R[1, 0], best_R[0, 0])))
     print(f"[SEOT] Best start: theta={best_theta:.1f}  refining ...")
@@ -769,12 +907,12 @@ def pairwise_align_seot(
         M_bio=M_bio,
         coords_A=coords_A,
         coords_B=coords_B,
-        a=a_np, b=b_np,
+        a=a_np, b=b_weighted,
         R_init=best_R,
         t_init=np.zeros(2),
         alpha=alpha,
-        rho_A=rho_A_use,
-        rho_B=rho_B_use,
+        rho_A=rho_A_final,
+        rho_B=rho_B_final,
         reg_sinkhorn=reg_sinkhorn,
         max_iter=max_em_iter,
         tol=tol_em,
