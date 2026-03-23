@@ -398,8 +398,13 @@ def pairwise_align_spatiotemporal(
     gamma:     float,
     radius:    float,
     filePath:  str,
-    # ── RAPA: region-aware partial alignment (strongly recommended for cross-timepoint) ──
-    use_rapa:               bool             = True,
+    # ── CAST: primary alignment method (recommended for all configurations) ──────────
+    use_rapa:               bool             = True,   # True=CAST, False=original BCD
+    cross_timepoint:        bool             = True,   # use cVAE for M_bio
+    use_lddmm:              bool             = False,  # LDDMM BCD for spatial deformation
+    max_em_iter:            int              = 50,     # SEOT EM iterations
+    reg_sinkhorn:           float            = 0.01,   # Sinkhorn entropic regularisation
+    # Legacy RAPA/BISPA params (kept for backward compatibility, unused by CAST)
     leiden_resolution:      float            = None,
     target_min_region_frac: float            = 0.20,
     lambda_anchor:          float            = 2.0,
@@ -551,20 +556,28 @@ def pairwise_align_spatiotemporal(
     #   (2) Balanced OT on a partial-overlap pair (use unbalanced FUGW)
     #   (3) No mechanism to choose the correct organ sub-region (use region matching)
     if use_rapa:
-        # SEOT: SE(2)-OT EM -- jointly recovers rotation/translation AND
-        # cell correspondences. BISPA provides symmetry-breaking initialisation.
-        from .seot import pairwise_align_seot
-        result = pairwise_align_seot(
+        # CAST: Coarse-to-fine Anatomical Spatial Transcriptomics alignment.
+        # Stage 1: Multi-scale cell-type descriptors (SE(2)-invariant)
+        # Stage 2: Candidate pair matching
+        # Stage 3: RANSAC SE(2) -- breaks bilateral symmetry via spatial consistency
+        # Stage 4: SEOT EM -- joint optimisation of (R,t) and correspondences
+        # Stage 5: LDDMM BCD (optional, cross-timepoint spatial deformation)
+        from .cast import pairwise_align_cast
+        result = pairwise_align_cast(
             sliceA=sliceA, sliceB=sliceB,
             alpha=alpha, beta=beta, gamma=gamma,
             radius=radius, filePath=filePath,
-            target_min_region_frac=target_min_region_frac,
-            lambda_anchor=lambda_anchor,
-            lambda_spatial=lambda_spatial,
-            lambda_target=lambda_target,
+            top_k_pairs=10,
+            ransac_n_iter=2000,
+            max_em_iter=max_em_iter,
+            reg_sinkhorn=reg_sinkhorn,
             cvae_model=cvae_model, cvae_path=cvae_path,
             cvae_epochs=cvae_epochs, cvae_latent_dim=cvae_latent_dim,
-            cross_timepoint=True,
+            cross_timepoint=cross_timepoint,
+            use_lddmm=use_lddmm,
+            sigma_v=sigma_v, lambda_v=lambda_v,
+            lddmm_lr=lddmm_lr, lddmm_n_iter=lddmm_n_iter,
+            n_bcd_rounds=n_bcd_rounds,
             use_rep=use_rep,
             numItermax=numItermax,
             use_gpu=use_gpu, gpu_verbose=gpu_verbose, verbose=verbose,
@@ -575,9 +588,10 @@ def pairwise_align_spatiotemporal(
         )
         if return_obj:
             pi, diag = result
-            return pi, diag['sliceA_aligned'], diag, diag['residual_history']
+            # Return 4-tuple matching original BCD signature
+            return pi, diag["sliceA_aligned"], diag, diag["residual_history"]
         return result
-    # -- End SEOT dispatch (use_rapa=False falls through to original BCD) -----
+    # -- End CAST dispatch (use_rapa=False falls through to original BCD) -----
 
     log_name = (f"{filePath}/log_st_{sliceA_name}_{sliceB_name}.txt"
                 if sliceA_name and sliceB_name else f"{filePath}/log_st.txt")

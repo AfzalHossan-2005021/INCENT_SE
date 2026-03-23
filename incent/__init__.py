@@ -29,6 +29,7 @@ from .core import (
     _preprocess,
     _to_np
 )
+
 from .utils import (
     fused_gromov_wasserstein_incent,
     jensenshannon_divergence_backend,
@@ -71,6 +72,14 @@ from .cvae import (
     latent_cost,
 )
 
+# ── INCENT-SE: CAST (the primary generalised alignment method) ─────────────
+from .cast import (
+    pairwise_align_cast,
+    compute_multiscale_descriptors,
+    find_candidate_pairs,
+    ransac_se2,
+)
+
 # ── INCENT-SE: SEOT (SE(2)-OT EM: explicit transformation recovery) ──────────
 from .seot import (
     pairwise_align_seot,
@@ -101,7 +110,6 @@ from .bispa import (
     compute_overlap_fractions,
 )
 
-
 # ── INCENT-SE: LDDMM deformation ─────────────────────────────────────────────
 from .lddmm import (
     LDDMMDeformation,
@@ -130,6 +138,9 @@ __all__ = [
     'build_spatial_affinity', 'augment_fgw_gradient',
     'contiguity_regulariser', 'contiguity_gradient', 'estimate_overlap_fraction',
     # cVAE
+    # CAST (the primary generalised solution)
+    'pairwise_align_cast', 'compute_multiscale_descriptors',
+    'find_candidate_pairs', 'ransac_se2',
     'INCENT_cVAE', 'train_cvae', 'latent_cost',
     # SEOT
     'pairwise_align_seot', 'weighted_procrustes', 'build_spatial_cost', 'seot_em',

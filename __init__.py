@@ -55,6 +55,12 @@ from .incent import (
     train_cvae,
     latent_cost,
 
+# ── INCENT-SE: CAST ──────────────────────────────────────────────────────────
+    pairwise_align_cast,
+    compute_multiscale_descriptors,
+    find_candidate_pairs,
+    ransac_se2,
+
 # ── INCENT-SE: SEOT (SE(2)-OT EM: explicit transformation recovery) ──────────
     pairwise_align_seot,
     weighted_procrustes,
@@ -121,6 +127,11 @@ __all__ = [
     'INCENT_cVAE',
     'train_cvae',
     'latent_cost',
+    # CAST
+    'pairwise_align_cast',
+    'compute_multiscale_descriptors',
+    'find_candidate_pairs',
+    'ransac_se2',
     # SEOT
     'pairwise_align_seot',
     'weighted_procrustes',
