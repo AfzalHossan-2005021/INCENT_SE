@@ -556,28 +556,21 @@ def pairwise_align_spatiotemporal(
     #   (2) Balanced OT on a partial-overlap pair (use unbalanced FUGW)
     #   (3) No mechanism to choose the correct organ sub-region (use region matching)
     if use_rapa:
-        # CAST: Coarse-to-fine Anatomical Spatial Transcriptomics alignment.
-        # Stage 1: Multi-scale cell-type descriptors (SE(2)-invariant)
-        # Stage 2: Candidate pair matching
-        # Stage 3: RANSAC SE(2) -- breaks bilateral symmetry via spatial consistency
-        # Stage 4: SEOT EM -- joint optimisation of (R,t) and correspondences
-        # Stage 5: LDDMM BCD (optional, cross-timepoint spatial deformation)
-        from .cast import pairwise_align_cast
-        result = pairwise_align_cast(
+        # SEOT: SE(2)-OT EM -- this gave near-perfect alignment.
+        # Jointly recovers rotation/translation AND cell correspondences.
+        # BISPA + expression-guided spectral provides symmetry-breaking init.
+        # Six improvements active: coordinate normalisation, multi-start EM,
+        # size-ratio rho, hemisphere-biased marginal, alpha warmup.
+        from .seot import pairwise_align_seot
+        result = pairwise_align_seot(
             sliceA=sliceA, sliceB=sliceB,
             alpha=alpha, beta=beta, gamma=gamma,
             radius=radius, filePath=filePath,
-            top_k_pairs=10,
-            ransac_n_iter=2000,
             max_em_iter=max_em_iter,
             reg_sinkhorn=reg_sinkhorn,
             cvae_model=cvae_model, cvae_path=cvae_path,
             cvae_epochs=cvae_epochs, cvae_latent_dim=cvae_latent_dim,
             cross_timepoint=cross_timepoint,
-            use_lddmm=use_lddmm,
-            sigma_v=sigma_v, lambda_v=lambda_v,
-            lddmm_lr=lddmm_lr, lddmm_n_iter=lddmm_n_iter,
-            n_bcd_rounds=n_bcd_rounds,
             use_rep=use_rep,
             numItermax=numItermax,
             use_gpu=use_gpu, gpu_verbose=gpu_verbose, verbose=verbose,
@@ -588,10 +581,9 @@ def pairwise_align_spatiotemporal(
         )
         if return_obj:
             pi, diag = result
-            # Return 4-tuple matching original BCD signature
-            return pi, diag["sliceA_aligned"], diag, diag["residual_history"]
+            return pi, diag['sliceA_aligned'], diag, diag['residual_history']
         return result
-    # -- End CAST dispatch (use_rapa=False falls through to original BCD) -----
+    # -- End SEOT dispatch (use_rapa=False falls through to original BCD) -----
 
     log_name = (f"{filePath}/log_st_{sliceA_name}_{sliceB_name}.txt"
                 if sliceA_name and sliceB_name else f"{filePath}/log_st.txt")
