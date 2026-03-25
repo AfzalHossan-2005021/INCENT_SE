@@ -303,10 +303,10 @@ def cg_incent(a, b, M1, M2, reg, f, df, gamma,
             a, b, M, reg=eps, reg_m=tau,
             numItermax=numItermax, log=True)
         # Re-normalise to keep transport plan as a probability coupling
-        nx_  = ot.backend.get_backend(res)
-        s    = nx_.sum(res)
-        if s > 0:
-            res = res / s
+        # nx_  = ot.backend.get_backend(res)
+        # s    = nx_.sum(res)
+        # if s > 0:
+        #     res = res / s
         return res, innerlog
 
     return generic_conditional_gradient_incent(
