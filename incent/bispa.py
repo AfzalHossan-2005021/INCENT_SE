@@ -640,8 +640,8 @@ def pairwise_align_bispa(
     unbalanced_solver="mm",
     max_iter_fugw=100,
     # Pose
-    rough_grid_size=256,
-    refined_grid_size=256,
+    rough_grid_size=512,
+    refined_grid_size=512,
     # cVAE (cross-timepoint)
     cvae_model=None,
     cvae_path=None,

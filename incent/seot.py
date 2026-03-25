@@ -488,7 +488,7 @@ def pairwise_align_seot(
     # BISPA initialisation
     target_min_region_frac: float = 0.20,
     matching_threshold: float = 0.85,
-    rough_grid_size: int = 256,
+    rough_grid_size: int = 512,
     # Anchor (penalise matching outside matched communities)
     use_anchor: bool = True,
     lambda_anchor: float = 2.0,

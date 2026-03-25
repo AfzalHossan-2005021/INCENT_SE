@@ -309,6 +309,75 @@ def _alignment_score(
     return score / max(n, 1)
 
 
+def _estimate_pose_once(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    grid_size: int,
+    sigma_px: float,
+    num_angles: int,
+    verbose: bool,
+) -> Tuple[float, float, float, float]:
+    """
+    Run one Fourier-Mellin pose estimation pass.
+
+    This is the core implementation without the low-score retry logic.
+    """
+    labels_A = np.asarray(sliceA.obs['cell_type_annot'].astype(str))
+    labels_B = np.asarray(sliceB.obs['cell_type_annot'].astype(str))
+    cell_types = np.intersect1d(np.unique(labels_A), np.unique(labels_B))
+
+    if len(cell_types) == 0:
+        raise ValueError("No shared cell types between slices.")
+
+    coords_A = sliceA.obsm['spatial'].copy().astype(np.float64)
+    coords_B = sliceB.obsm['spatial'].copy().astype(np.float64)
+
+    # Centre each slice independently so world-coordinate offsets do not
+    # dilute the Fourier signal.
+    cA, centroid_A, span_A = _centre_coords(coords_A)
+    cB, centroid_B, span_B = _centre_coords(coords_B)
+    half_span = max(span_A, span_B)
+
+    density_A = _rasterise_density_centred(
+        cA, labels_A, cell_types, grid_size, half_span, sigma_px)
+    density_B = _rasterise_density_centred(
+        cB, labels_B, cell_types, grid_size, half_span, sigma_px)
+
+    if verbose:
+        print("[pose] Computing log-polar Fourier spectra …")
+    lp_A = _log_polar_spectrum(density_A, num_angles)
+    lp_B = _log_polar_spectrum(density_B, num_angles)
+
+    if verbose:
+        print("[pose] Estimating rotation via NCC …")
+    theta0 = _ncc_peak_angle(lp_A, lp_B, num_angles)
+    theta1 = (theta0 + 180.0) % 360.0
+
+    R0 = _rotation_matrix(theta0)
+    R1 = _rotation_matrix(theta1)
+    cA0 = (R0 @ cA.T).T
+    cA1 = (R1 @ cA.T).T
+    sc0 = _alignment_score(cA0, labels_A, cB, labels_B, cell_types, grid_size, half_span)
+    sc1 = _alignment_score(cA1, labels_A, cB, labels_B, cell_types, grid_size, half_span)
+
+    if sc0 >= sc1:
+        theta_best, best_score = theta0, sc0
+        if verbose:
+            print(f"[pose] θ={theta0:.1f}° (score={sc0:.3f})  "
+                  f"vs θ+180={theta1:.1f}° (score={sc1:.3f})  → chose {theta0:.1f}°")
+    else:
+        theta_best, best_score = theta1, sc1
+        if verbose:
+            print(f"[pose] θ+180={theta1:.1f}° (score={sc1:.3f})  "
+                  f"vs θ={theta0:.1f}° (score={sc0:.3f})  → chose {theta1:.1f}°")
+
+    R_best = _rotation_matrix(theta_best)
+    t_vec = centroid_B - R_best @ centroid_A
+    tx, ty = float(t_vec[0]), float(t_vec[1])
+
+    return float(theta_best), tx, ty, float(best_score)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC FUNCTION: estimate_pose
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,6 +388,7 @@ def estimate_pose(
     grid_size: int = 256,
     sigma_px: float = 2.5,
     num_angles: int = 360,
+    retry_grid_size: Optional[int] = 512,
     verbose: bool = True,
 ) -> Tuple[float, float, float, float]:
     """
@@ -354,6 +424,9 @@ def estimate_pose(
         but slightly lower angular precision.
     num_angles : int, default 360
         Angular resolution of the log-polar grid (1° per bin).
+    retry_grid_size : int or None, default 512
+        If the first score falls below 0.15, retry once at this larger
+        grid size when it exceeds ``grid_size``. Set to None to disable.
     verbose : bool, default True
 
     Returns
@@ -372,68 +445,20 @@ def estimate_pose(
     """
     if verbose:
         print("[pose] Rasterising cell-type density fields …")
+    theta_best, tx, ty, best_score = _estimate_pose_once(
+        sliceA, sliceB, grid_size, sigma_px, num_angles, verbose)
 
-    labels_A  = np.asarray(sliceA.obs['cell_type_annot'].astype(str))
-    labels_B  = np.asarray(sliceB.obs['cell_type_annot'].astype(str))
-    cell_types = np.intersect1d(np.unique(labels_A), np.unique(labels_B))
-
-    if len(cell_types) == 0:
-        raise ValueError("No shared cell types between slices.")
-
-    coords_A = sliceA.obsm['spatial'].copy().astype(np.float64)
-    coords_B = sliceB.obsm['spatial'].copy().astype(np.float64)
-
-    # ── Centre each slice independently ─────────────────────────────────────
-    # KEY FIX: prevents the huge-tx/ty bug when slices sit in different
-    # regions of world space.  Rotation is centroid-invariant so θ is exact;
-    # translation is recovered analytically below.
-    cA, centroid_A, span_A = _centre_coords(coords_A)
-    cB, centroid_B, span_B = _centre_coords(coords_B)
-    half_span = max(span_A, span_B)     # common scale so pixel ↔ world is consistent
-
-    # ── Rasterise ────────────────────────────────────────────────────────────
-    density_A = _rasterise_density_centred(
-        cA, labels_A, cell_types, grid_size, half_span, sigma_px)
-    density_B = _rasterise_density_centred(
-        cB, labels_B, cell_types, grid_size, half_span, sigma_px)
-
-    # ── Log-polar Fourier spectra ─────────────────────────────────────────────
-    if verbose:
-        print("[pose] Computing log-polar Fourier spectra …")
-    lp_A = _log_polar_spectrum(density_A, num_angles)
-    lp_B = _log_polar_spectrum(density_B, num_angles)
-
-    # ── Rotation via NCC ──────────────────────────────────────────────────────
-    if verbose:
-        print("[pose] Estimating rotation via NCC …")
-    theta0 = _ncc_peak_angle(lp_A, lp_B, num_angles)
-    theta1 = (theta0 + 180.0) % 360.0
-
-    # ── Score both candidates ─────────────────────────────────────────────────
-    R0   = _rotation_matrix(theta0)
-    R1   = _rotation_matrix(theta1)
-    cA0  = (R0 @ cA.T).T
-    cA1  = (R1 @ cA.T).T
-    sc0  = _alignment_score(cA0, labels_A, cB, labels_B, cell_types, grid_size, half_span)
-    sc1  = _alignment_score(cA1, labels_A, cB, labels_B, cell_types, grid_size, half_span)
-
-    if sc0 >= sc1:
-        theta_best, best_score = theta0, sc0
+    if best_score < 0.15 and retry_grid_size is not None and retry_grid_size > grid_size:
         if verbose:
-            print(f"[pose] θ={theta0:.1f}° (score={sc0:.3f})  "
-                  f"vs θ+180={theta1:.1f}° (score={sc1:.3f})  → chose {theta0:.1f}°")
-    else:
-        theta_best, best_score = theta1, sc1
-        if verbose:
-            print(f"[pose] θ+180={theta1:.1f}° (score={sc1:.3f})  "
-                  f"vs θ={theta0:.1f}° (score={sc0:.3f})  → chose {theta1:.1f}°")
-
-    # ── Translation from centroid offset ──────────────────────────────────────
-    # t = centroid_B − R(θ) · centroid_A
-    # Rotating sliceA by θ and then adding t maps centroid_A to centroid_B.
-    R_best = _rotation_matrix(theta_best)
-    t_vec  = centroid_B - R_best @ centroid_A
-    tx, ty = float(t_vec[0]), float(t_vec[1])
+            print(f"[pose] Low score ({best_score:.3f}); retrying at grid_size={retry_grid_size} …")
+        retry_theta, retry_tx, retry_ty, retry_score = _estimate_pose_once(
+            sliceA, sliceB, retry_grid_size, sigma_px, num_angles, verbose)
+        if retry_score > best_score:
+            theta_best, tx, ty, best_score = retry_theta, retry_tx, retry_ty, retry_score
+            if verbose:
+                print(f"[pose] Retry improved score to {best_score:.3f}; keeping retry result.")
+        elif verbose:
+            print(f"[pose] Retry score={retry_score:.3f} did not improve; keeping initial result.")
 
     if verbose:
         print(f"[pose] Done. θ={theta_best:.2f}°  tx={tx:.2f}  ty={ty:.2f}  "
