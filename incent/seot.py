@@ -81,10 +81,12 @@ from ._seot_support import (
     build_bidirectional_anchor,
     build_community_similarity,
     build_target_affinity,
+    compute_objective_summary,
     compute_overlap_fractions,
     decompose_slice,
     hungarian_matching,
     recover_pose_matched,
+    save_initialisation_plots,
     target_contiguity_gradient,
 )
 
@@ -410,6 +412,8 @@ def _initialise_from_bispa(
     matching_threshold: float,
     rough_grid_size: int,
     verbose: bool,
+    plot_output_dir: Optional[str] = None,
+    plot_prefix: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, dict]:
     """
     Use BISPA community matching to compute (R_init, t_init) for the EM loop.
@@ -461,7 +465,25 @@ def _initialise_from_bispa(
         "unmatched_A": unmatched_A, "unmatched_B": unmatched_B,
         "s_A": s_A, "s_B": s_B,
         "theta_init": theta_ref, "pose_score": pose_score,
+        "initialisation_plots": {},
     }
+
+    if plot_output_dir is not None:
+        bispa_info["initialisation_plots"] = save_initialisation_plots(
+            sliceA_rough=sliceA_rough,
+            labels_A=labels_A,
+            sliceB=sliceB,
+            labels_B=labels_B,
+            S=S,
+            comms_A=comms_A,
+            comms_B=comms_B,
+            matched_pairs=matched_pairs,
+            theta_deg=theta_ref,
+            tx=tx_ref,
+            ty=ty_ref,
+            output_dir=plot_output_dir,
+            prefix=plot_prefix or "seot_init",
+        )
 
     if verbose:
         print(f"[SEOT init] R_init: theta={theta_ref:.1f}  "
@@ -517,6 +539,9 @@ def pairwise_align_seot(
     sliceB_name: Optional[str] = None,
     overwrite: bool = False,
     neighborhood_dissimilarity: str = "jsd",
+    save_init_plots: bool = False,
+    init_plot_dir: Optional[str] = None,
+    init_plot_prefix: Optional[str] = None,
     return_diagnostics: bool = False,
 ):
     """
@@ -630,12 +655,17 @@ def pairwise_align_seot(
     # STEP 1: BISPA initialisation  -> (R_init, t_init, s_A, s_B)
     # ==================================================================
     print("[SEOT] Step 1: BISPA initialisation ...")
+    plot_dir = None
+    if save_init_plots:
+        plot_dir = init_plot_dir or os.path.join(filePath, "seot_initialisation_plots")
     R_init, t_init, pose_score, bispa_info = _initialise_from_bispa(
         sliceA, sliceB,
         target_min_region_frac=target_min_region_frac,
         matching_threshold=matching_threshold,
         rough_grid_size=rough_grid_size,
         verbose=gpu_verbose,
+        plot_output_dir=plot_dir,
+        plot_prefix=init_plot_prefix,
     )
     s_A = bispa_info["s_A"]
     s_B = bispa_info["s_B"]
@@ -995,12 +1025,20 @@ def pairwise_align_seot(
             rs = pi.sum(axis=1, keepdims=True)
             pi = pi / np.maximum(rs, 1e-12) * a_np[:, None]
 
+    objective_summary = compute_objective_summary(p, pi)
     pi_mass = float(pi.sum())
     runtime = time.time() - start_time
 
     log.write(f"EM converged: {len(history)} iterations\n")
     log.write(f"R_total:\n{R_total}\nt_total={t_total}\n")
     log.write(f"theta_total={theta_total:.2f}  pi_mass={pi_mass:.4f}\n")
+    log.write(
+        "Objective summary: "
+        f"init_nb={objective_summary['initial_obj_neighbor']:.6f}  "
+        f"init_gene={objective_summary['initial_obj_gene_cos']:.6f}  "
+        f"final_nb={objective_summary['final_obj_neighbor']:.6f}  "
+        f"final_gene={objective_summary['final_obj_gene_cos']:.6f}\n"
+    )
     log.write(f"Runtime={runtime:.1f}s\n")
     log.close()
 
@@ -1029,5 +1067,7 @@ def pairwise_align_seot(
             "matched_pairs": matched_pairs,
             "sliceA_aligned": sliceA_aligned,
             "bispa_info": bispa_info,
+            "initialisation_plots": bispa_info.get("initialisation_plots", {}),
+            "objective_summary": objective_summary,
         }
     return pi

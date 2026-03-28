@@ -14,6 +14,35 @@ from anndata import AnnData
 from ._gpu import resolve_device, to_torch
 
 
+def compute_objective_summary(preprocess_result: dict, pi) -> dict:
+    """Compute old-style initial/final neighbour and gene-cosine objectives."""
+    from .core import _to_np
+
+    M_neighbor = _to_np(preprocess_result["M2"]).astype(np.float64)
+    M_gene_cos = _to_np(preprocess_result["cosine_dist_gene_expr"]).astype(np.float64)
+    pi_np = _to_np(pi).astype(np.float64)
+
+    n_A, n_B = M_neighbor.shape
+    G0 = np.full((n_A, n_B), 1.0 / (n_A * n_B), dtype=np.float64)
+
+    return {
+        "initial_obj_neighbor": float(np.sum(M_neighbor * G0)),
+        "initial_obj_gene_cos": float(np.sum(M_gene_cos * G0)),
+        "final_obj_neighbor": float(np.sum(M_neighbor * pi_np)),
+        "final_obj_gene_cos": float(np.sum(M_gene_cos * pi_np)),
+    }
+
+
+def objective_summary_tuple(summary: dict) -> tuple:
+    """Return objective summary values in the legacy tuple order."""
+    return (
+        summary["initial_obj_neighbor"],
+        summary["initial_obj_gene_cos"],
+        summary["final_obj_neighbor"],
+        summary["final_obj_gene_cos"],
+    )
+
+
 def apply_rotation_only_pose(
     sliceA: AnnData,
     sliceB: AnnData,
@@ -531,3 +560,204 @@ def target_contiguity_gradient(
 
     grad = (D_A @ pi) @ W_B
     return 2.0 * np.asarray(grad, dtype=np.float64)
+
+
+def save_initialisation_plots(
+    sliceA_rough: AnnData,
+    labels_A: np.ndarray,
+    sliceB: AnnData,
+    labels_B: np.ndarray,
+    S: np.ndarray,
+    comms_A: np.ndarray,
+    comms_B: np.ndarray,
+    matched_pairs,
+    theta_deg: float,
+    tx: float,
+    ty: float,
+    output_dir: str,
+    prefix: str = "seot_init",
+    dpi: int = 220,
+):
+    """
+    Save presentation-friendly plots for SEOT initialisation stages.
+
+    Returns a dict with the saved file paths. If matplotlib is unavailable,
+    returns an empty dict and emits a warning.
+    """
+    import os
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import patches
+    except ImportError:
+        warnings.warn(
+            "[SEOT] matplotlib is not installed; skipping initialisation plots.",
+            stacklevel=2,
+        )
+        return {}
+
+    from .pose import apply_pose
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    coords_A = sliceA_rough.obsm["spatial"].astype(np.float64)
+    coords_B = sliceB.obsm["spatial"].astype(np.float64)
+    sliceA_matched = apply_pose(sliceA_rough, theta_deg, tx, ty, inplace=False)
+    coords_A_matched = sliceA_matched.obsm["spatial"].astype(np.float64)
+
+    tab20 = plt.get_cmap("tab20")
+    pair_colors = [tab20(i % tab20.N) for i in range(max(len(matched_pairs), 1))]
+    paths = {}
+
+    def _style_axis(ax, title: str):
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    def _annotate_centroids(ax, coords: np.ndarray, labels: np.ndarray, prefix_text: str):
+        for k in np.unique(labels):
+            centroid = coords[labels == k].mean(axis=0)
+            ax.text(
+                centroid[0],
+                centroid[1],
+                f"{prefix_text}{k}",
+                fontsize=9,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
+            )
+
+    # Step 2: decomposition
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7), constrained_layout=True)
+    axes[0].scatter(coords_A[:, 0], coords_A[:, 1], c=labels_A, cmap="tab20", s=10, alpha=0.9, linewidths=0)
+    axes[1].scatter(coords_B[:, 0], coords_B[:, 1], c=labels_B, cmap="tab20", s=10, alpha=0.9, linewidths=0)
+    _annotate_centroids(axes[0], coords_A, labels_A, "A:C_")
+    _annotate_centroids(axes[1], coords_B, labels_B, "B:C_")
+    _style_axis(axes[0], "Step 2: sliceA rough-frame communities")
+    _style_axis(axes[1], "Step 2: sliceB communities")
+    fig.suptitle(
+        "SEOT Initialisation - Spatial Community Decomposition",
+        fontsize=16,
+        fontweight="bold",
+    )
+    decomp_path = os.path.join(output_dir, f"{prefix}_step2_decomposition.png")
+    fig.savefig(decomp_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    paths["step2_decomposition"] = decomp_path
+
+    # Step 3: matching matrix + recovered pose
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
+
+    ax_heat = axes[0]
+    im = ax_heat.imshow(S, cmap="viridis_r", aspect="auto")
+    ax_heat.set_title("Step 3: community similarity matrix", fontsize=13, fontweight="bold")
+    ax_heat.set_xlabel("sliceB community")
+    ax_heat.set_ylabel("sliceA community")
+    ax_heat.set_xticks(np.arange(len(comms_B)))
+    ax_heat.set_yticks(np.arange(len(comms_A)))
+    ax_heat.set_xticklabels([f"C_{k}" for k in comms_B], rotation=0)
+    ax_heat.set_yticklabels([f"C_{k}" for k in comms_A])
+    for i in range(S.shape[0]):
+        for j in range(S.shape[1]):
+            ax_heat.text(j, i, f"{S[i, j]:.2f}", ha="center", va="center", color="white", fontsize=9)
+    for idx, (k_A, k_B) in enumerate(matched_pairs):
+        i = int(np.where(comms_A == k_A)[0][0])
+        j = int(np.where(comms_B == k_B)[0][0])
+        ax_heat.add_patch(
+            patches.Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False, linewidth=2.5, edgecolor=pair_colors[idx])
+        )
+    fig.colorbar(im, ax=ax_heat, shrink=0.82, label="lower is better")
+
+    ax_overlay = axes[1]
+    ax_overlay.scatter(coords_B[:, 0], coords_B[:, 1], c="#d7dce2", s=8, alpha=0.35, linewidths=0, label="sliceB background")
+
+    matched_A = {k for k, _ in matched_pairs}
+    matched_B = {k for _, k in matched_pairs}
+    if len(np.unique(labels_B)) > len(matched_B):
+        mask_unmatched_B = ~np.isin(labels_B, list(matched_B))
+        ax_overlay.scatter(
+            coords_B[mask_unmatched_B, 0],
+            coords_B[mask_unmatched_B, 1],
+            c="#aab3bd",
+            s=8,
+            alpha=0.55,
+            linewidths=0,
+            label="unmatched B communities",
+        )
+
+    for idx, (k_A, k_B) in enumerate(matched_pairs):
+        color = pair_colors[idx]
+        mask_A = labels_A == k_A
+        mask_B = labels_B == k_B
+        ax_overlay.scatter(
+            coords_B[mask_B, 0],
+            coords_B[mask_B, 1],
+            c=[color],
+            s=10,
+            alpha=0.18,
+            linewidths=0,
+        )
+        ax_overlay.scatter(
+            coords_A_matched[mask_A, 0],
+            coords_A_matched[mask_A, 1],
+            c=[color],
+            s=14,
+            alpha=0.88,
+            marker="^",
+            linewidths=0,
+            label=f"A C_{k_A} <-> B C_{k_B}",
+        )
+        cA = coords_A_matched[mask_A].mean(axis=0)
+        cB = coords_B[mask_B].mean(axis=0)
+        ax_overlay.plot([cA[0], cB[0]], [cA[1], cB[1]], color=color, linewidth=2.0, alpha=0.95)
+        ax_overlay.text(
+            cA[0],
+            cA[1],
+            f"A:C_{k_A}",
+            fontsize=9,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        )
+        ax_overlay.text(
+            cB[0],
+            cB[1],
+            f"B:C_{k_B}",
+            fontsize=9,
+            fontweight="bold",
+            ha="center",
+            va="center",
+            bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        )
+
+    if len(np.unique(labels_A)) > len(matched_A):
+        mask_unmatched_A = ~np.isin(labels_A, list(matched_A))
+        ax_overlay.scatter(
+            coords_A_matched[mask_unmatched_A, 0],
+            coords_A_matched[mask_unmatched_A, 1],
+            c="#4f5b66",
+            s=12,
+            alpha=0.6,
+            marker="^",
+            linewidths=0,
+            label="unmatched A communities",
+        )
+
+    _style_axis(ax_overlay, "Step 3: matched communities after recovered pose")
+    ax_overlay.legend(loc="upper right", fontsize=8, frameon=True)
+    fig.suptitle(
+        f"SEOT Initialisation - Matching and Fine Translation  (theta={theta_deg:.1f}, tx={tx:.1f}, ty={ty:.1f})",
+        fontsize=16,
+        fontweight="bold",
+    )
+    match_path = os.path.join(output_dir, f"{prefix}_step3_matching.png")
+    fig.savefig(match_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    paths["step3_matching"] = match_path
+
+    return paths
