@@ -28,7 +28,6 @@ import time
 import datetime
 import numpy as np
 import ot
-import torch
 
 from typing import Optional, Tuple, Union
 from numpy.typing import NDArray
@@ -42,9 +41,6 @@ from .utils import fused_gromov_wasserstein_incent
 from .pose        import estimate_pose, apply_pose
 from .topology    import compute_fingerprints, fingerprint_cost
 from .contiguity  import build_spatial_affinity, augment_fgw_gradient
-from .cvae        import INCENT_cVAE, latent_cost
-from .lddmm       import (estimate_deformation, deformed_distances,
-                           estimate_growth_vector, LDDMMDeformation)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -177,6 +173,45 @@ def pairwise_align_se(
     """
     start = time.time()
     os.makedirs(filePath, exist_ok=True)
+
+    if not use_rapa:
+        raise NotImplementedError(
+            "This cleaned codebase keeps only the SEOT-backed "
+            "pairwise_align_spatiotemporal path. Use use_rapa=True."
+        )
+
+    from .seot import pairwise_align_seot
+
+    result = pairwise_align_seot(
+        sliceA=sliceA,
+        sliceB=sliceB,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        radius=radius,
+        filePath=filePath,
+        max_em_iter=max_em_iter,
+        reg_sinkhorn=reg_sinkhorn,
+        cvae_model=cvae_model,
+        cvae_path=cvae_path,
+        cvae_epochs=cvae_epochs,
+        cvae_latent_dim=cvae_latent_dim,
+        cross_timepoint=cross_timepoint,
+        use_rep=use_rep,
+        numItermax=numItermax,
+        use_gpu=use_gpu,
+        gpu_verbose=gpu_verbose,
+        verbose=verbose,
+        sliceA_name=sliceA_name,
+        sliceB_name=sliceB_name,
+        overwrite=overwrite,
+        neighborhood_dissimilarity=neighborhood_dissimilarity,
+        return_diagnostics=return_obj,
+    )
+    if return_obj:
+        pi, diag = result
+        return pi, diag["sliceA_aligned"], diag, diag["residual_history"]
+    return result
 
     # ── Logging setup ─────────────────────────────────────────────────────────
     log_name = (f"{filePath}/log_se_{sliceA_name}_{sliceB_name}.txt"
@@ -410,7 +445,7 @@ def pairwise_align_spatiotemporal(
     lambda_anchor:          float            = 2.0,
     lambda_target:          float            = 0.1,
     # ── cVAE for expression embedding ─────────────────────────────────────────
-    cvae_model: Optional[INCENT_cVAE]  = None,
+    cvae_model: Optional[object]       = None,
     cvae_path:  Optional[str]          = None,
     cvae_epochs: int                   = 100,
     cvae_latent_dim: int               = 32,

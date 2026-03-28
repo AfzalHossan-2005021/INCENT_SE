@@ -76,7 +76,17 @@ import numpy as np
 from typing import Optional, Tuple, List
 from anndata import AnnData
 
-from ._gpu import resolve_device, to_torch, to_numpy
+from ._seot_support import (
+    apply_rotation_only_pose,
+    build_bidirectional_anchor,
+    build_community_similarity,
+    build_target_affinity,
+    compute_overlap_fractions,
+    decompose_slice,
+    hungarian_matching,
+    recover_pose_matched,
+    target_contiguity_gradient,
+)
 
 
 # ==========================================================================
@@ -410,10 +420,6 @@ def _initialise_from_bispa(
 
     Returns R_init, t_init, match_score, bispa_info dict.
     """
-    from .bispa import (
-        decompose_slice, build_community_similarity, hungarian_matching,
-        recover_pose_matched, compute_overlap_fractions,
-    )
     from .pose import _rotation_matrix
 
     if verbose:
@@ -423,7 +429,6 @@ def _initialise_from_bispa(
     from .pose import estimate_pose
     theta_rough, _, _, _ = estimate_pose(
         sliceA, sliceB, grid_size=rough_grid_size, verbose=False)
-    from .rapa import apply_rotation_only_pose
     sliceA_rough = apply_rotation_only_pose(sliceA, sliceB, theta_rough, verbose=False)
 
     labels_A = decompose_slice(
@@ -693,7 +698,6 @@ def pairwise_align_seot(
                 model.save(cvae_path)
 
     # Apply BISPA rotation-only pose to sliceA so coordinates are in B's rough frame
-    from .rapa import apply_rotation_only_pose
     from .pose import _rotation_matrix
     sliceA_rough = apply_rotation_only_pose(sliceA, sliceB, bispa_info["theta_init"],
                                             verbose=False)
@@ -737,7 +741,6 @@ def pairwise_align_seot(
 
     # Anchor cost (penalise transport outside matched communities)
     if use_anchor and matched_pairs:
-        from .bispa import build_bidirectional_anchor
         def _remap(labels_full, adata_full, adata_filt):
             bc_full = np.array(adata_full.obs_names)
             bc_filt = np.array(adata_filt.obs_names)
@@ -977,7 +980,6 @@ def pairwise_align_seot(
     if lambda_spatial > 0.0 or lambda_target > 0.0:
         print("[SEOT] Step 4: Bilateral contiguity refinement ...")
         from .contiguity import contiguity_gradient, build_spatial_affinity
-        from .rapa import target_contiguity_gradient, build_target_affinity
         sigma_c = radius / 3.0
         D_B_np = _to_np(p["D_B"])
         D_A_np = _to_np(p["D_A"])

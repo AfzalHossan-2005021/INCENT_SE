@@ -40,7 +40,7 @@ latent_cost(adata_A, adata_B, model) → np.ndarray  [(n_A, n_B) M_latent]
 """
 
 import numpy as np
-from typing import List, Optional
+from typing import List
 from anndata import AnnData
 
 
